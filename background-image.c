@@ -1,7 +1,11 @@
 #include <assert.h>
+#include <gio/gunixinputstream.h>
+
 #include "background-image.h"
 #include "cairo_util.h"
 #include "log.h"
+
+
 
 enum background_mode parse_background_mode(const char *mode) {
 	if (strcmp(mode, "stretch") == 0) {
@@ -21,10 +25,24 @@ enum background_mode parse_background_mode(const char *mode) {
 	return BACKGROUND_MODE_INVALID;
 }
 
-cairo_surface_t *load_background_image(const char *path) {
+cairo_surface_t *load_background_image(int file_fd) {
 	cairo_surface_t *image;
 	GError *err = NULL;
-	GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(path, &err);
+
+	if (lseek(file_fd, 0, SEEK_SET) == -1) {
+		swaybg_log(LOG_ERROR, "Failed to seek to start of image data");
+		return NULL;
+	}
+
+	GInputStream *stream = g_unix_input_stream_new(file_fd, 0);
+	if (!stream) {
+		swaybg_log(LOG_ERROR, "Failed to create image data stream");
+		return NULL;
+	}
+
+	GdkPixbuf *pixbuf = gdk_pixbuf_new_from_stream(stream, NULL, &err);
+	g_object_unref(stream);
+
 	if (!pixbuf) {
 		swaybg_log(LOG_ERROR, "Failed to load background image (%s).",
 				err->message);

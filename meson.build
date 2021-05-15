@@ -30,6 +30,7 @@ wayland_client = dependency('wayland-client')
 wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 cairo          = dependency('cairo')
 gdk_pixbuf     = dependency('gdk-pixbuf-2.0')
+gio_unix       = dependency('gio-unix-2.0')
 
 git = find_program('git', required: false)
 scdoc = find_program('scdoc', required: get_option('man-pages'))
@@ -99,6 +100,7 @@ dependencies = [
 	cairo,
 	client_protos,
 	gdk_pixbuf,
+	gio_unix,
 	wayland_client,
 ]
 

@@ -1,12 +1,15 @@
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <ctype.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <wayland-client.h>
 #include "background-image.h"
 #include "cairo_util.h"
@@ -47,7 +50,8 @@ struct swaybg_state {
 
 struct swaybg_image {
 	const char *image_path;
-	cairo_surface_t *surface;
+	int width, height;
+	int image_fd;
 	struct wl_list link;
 };
 
@@ -124,14 +128,15 @@ static void render_frame(struct swaybg_output *output) {
 			cairo_paint(cairo);
 		}
 		cairo_surface_t *surface = load_background_image(
-				output->config->image->image_path);
+				output->config->image->image_fd);
 		if (!surface) {
-			swaybg_log(LOG_DEBUG, "Failed to load background image %s",
+			swaybg_log(LOG_ERROR, "Failed to load background image %s",
 					output->config->image->image_path);
+		} else {
+			render_background_image(cairo, surface,
+					output->config->mode, buffer_width, buffer_height);
+			cairo_surface_destroy(surface);
 		}
-		render_background_image(cairo, surface,
-				output->config->mode, buffer_width, buffer_height);
-		cairo_surface_destroy(surface);
 	}
 
 	wl_surface_set_buffer_scale(output->surface, output->scale);
@@ -146,8 +151,8 @@ static void destroy_swaybg_image(struct swaybg_image *image) {
 	if (!image) {
 		return;
 	}
-	if (image->surface) {
-		cairo_surface_destroy(image->surface);
+	if (image->image_fd != -1) {
+		close(image->image_fd);
 	}
 	wl_list_remove(&image->link);
 	free(image);
@@ -526,9 +531,18 @@ static void parse_command_line(int argc, char **argv,
 		if (!image) {
 			continue;
 		}
+		image->image_fd = -1;
 		image->image_path = config->image_path;
 		wl_list_insert(&state->images, &image->link);
 		config->image = image;
+	}
+
+	wl_list_for_each(image, &state->images, link) {
+		image->image_fd = open(image->image_path, O_RDONLY);
+		if (image->image_fd == -1) {
+			swaybg_log(LOG_ERROR, "Failed to open background image at %s",
+					image->image_path);
+		}
 	}
 
 	// Set default mode and remove empties
