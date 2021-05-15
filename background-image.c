@@ -5,8 +5,6 @@
 #include "cairo_util.h"
 #include "log.h"
 
-
-
 enum background_mode parse_background_mode(const char *mode) {
 	if (strcmp(mode, "stretch") == 0) {
 		return BACKGROUND_MODE_STRETCH;
@@ -25,7 +23,9 @@ enum background_mode parse_background_mode(const char *mode) {
 	return BACKGROUND_MODE_INVALID;
 }
 
-cairo_surface_t *load_background_image(int file_fd) {
+cairo_surface_t *load_background_image(int file_fd,
+		enum background_mode mode, int image_width, int image_height,
+		int buffer_width, int buffer_height) {
 	cairo_surface_t *image;
 	GError *err = NULL;
 
@@ -34,13 +34,58 @@ cairo_surface_t *load_background_image(int file_fd) {
 		return NULL;
 	}
 
-	GInputStream *stream = g_unix_input_stream_new(file_fd, 0);
+	GInputStream *stream = g_unix_input_stream_new(file_fd, FALSE);
 	if (!stream) {
 		swaybg_log(LOG_ERROR, "Failed to create image data stream");
 		return NULL;
 	}
 
-	GdkPixbuf *pixbuf = gdk_pixbuf_new_from_stream(stream, NULL, &err);
+	GdkPixbuf *pixbuf;
+	if (image_width < buffer_width && image_height < buffer_height) {
+		// Let cairo do the rescaling when the image is smaller
+		// (or if image_width=image_height=0 due to failed info loading)
+		mode = BACKGROUND_MODE_INVALID;
+	}
+
+	// For oversized images, it is generally faster and uses less memory
+	// to scale them as they are being loaded
+	switch (mode) {
+	case BACKGROUND_MODE_STRETCH:
+		pixbuf = gdk_pixbuf_new_from_stream_at_scale(stream,
+				buffer_width, buffer_height, FALSE,
+				NULL, &err);
+		break;
+	case BACKGROUND_MODE_FIT: {
+		double window_ratio = (double)buffer_width / buffer_height;
+		double bg_ratio = (double)image_width / image_height;
+
+		if (window_ratio > bg_ratio) {
+			pixbuf = gdk_pixbuf_new_from_stream_at_scale(stream,
+					-1, buffer_height, TRUE, NULL, &err);
+		} else {
+			pixbuf = gdk_pixbuf_new_from_stream_at_scale(stream,
+					buffer_width, -1, TRUE, NULL, &err);
+		}
+		break;
+	}
+	case BACKGROUND_MODE_FILL: {
+		double window_ratio = (double)buffer_width / buffer_height;
+		double bg_ratio = (double)image_width / image_height;
+
+		if (window_ratio > bg_ratio) {
+			pixbuf = gdk_pixbuf_new_from_stream_at_scale(stream,
+					buffer_width, -1, TRUE, NULL, &err);
+		} else {
+			pixbuf = gdk_pixbuf_new_from_stream_at_scale(stream,
+					-1, buffer_height, TRUE, NULL, &err);
+		}
+		break;
+	}
+	default: {
+		pixbuf = gdk_pixbuf_new_from_stream(stream, NULL, &err);
+		break;
+	}
+	}
 	g_object_unref(stream);
 
 	if (!pixbuf) {
