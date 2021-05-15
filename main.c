@@ -193,9 +193,7 @@ static void output_scale(void *data, struct wl_output *wl_output,
 		int32_t scale) {
 	struct swaybg_output *output = data;
 	output->scale = scale;
-	if (output->state->run_display && output->width > 0 && output->height > 0) {
-		render_frame(output);
-	}
+	// next configure event will trigger redraw
 }
 
 static const struct wl_output_listener output_listener = {
