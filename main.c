@@ -123,8 +123,11 @@ static void render_frame(struct swaybg_output *output) {
 			cairo_set_source_u32(cairo, output->config->color);
 			cairo_paint(cairo);
 		}
+		cairo_surface_t *surface = load_background_image(
+				output->config->image->image_path);
 		render_background_image(cairo, output->config->image->surface,
 				output->config->mode, buffer_width, buffer_height);
+		cairo_surface_destroy(surface);
 	}
 
 	wl_surface_set_buffer_scale(output->surface, output->scale);
@@ -524,19 +527,11 @@ static void parse_command_line(int argc, char **argv,
 		config->image = image;
 	}
 
-	wl_list_for_each(image, &state->images, link) {
-		image->surface = load_background_image(image->image_path);
-		if (!image->surface) {
-			swaybg_log(LOG_ERROR, "Failed to load image: %s", image->image_path);
-			// will now act as though image was not specified
-		}
-	}
-
 	// Set default mode and remove empties
 	config = NULL;
 	struct swaybg_output_config *tmp = NULL;
 	wl_list_for_each_safe(config, tmp, &state->configs, link) {
-		bool has_image = config->image && config->image->surface;
+		bool has_image = config->image;
 		if (!has_image && !config->color) {
 			destroy_swaybg_output_config(config);
 		} else if (config->mode == BACKGROUND_MODE_INVALID) {
