@@ -29,7 +29,7 @@ endif
 wayland_client = dependency('wayland-client')
 wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 cairo          = dependency('cairo')
-gdk_pixbuf     = dependency('gdk-pixbuf-2.0', required: get_option('gdk-pixbuf'))
+gdk_pixbuf     = dependency('gdk-pixbuf-2.0')
 
 git = find_program('git', required: false)
 scdoc = find_program('scdoc', required: get_option('man-pages'))
@@ -92,7 +92,6 @@ client_protos = declare_dependency(
 )
 
 conf_data = configuration_data()
-conf_data.set10('HAVE_GDK_PIXBUF', gdk_pixbuf.found())
 
 subdir('include')
 

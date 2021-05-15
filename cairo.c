@@ -1,9 +1,7 @@
 #include <stdint.h>
 #include <cairo.h>
 #include "cairo_util.h"
-#if HAVE_GDK_PIXBUF
 #include <gdk-pixbuf/gdk-pixbuf.h>
-#endif
 
 void cairo_set_source_u32(cairo_t *cairo, uint32_t color) {
 	cairo_set_source_rgba(cairo,
@@ -29,7 +27,6 @@ cairo_subpixel_order_t to_cairo_subpixel_order(enum wl_output_subpixel subpixel)
 	return CAIRO_SUBPIXEL_ORDER_DEFAULT;
 }
 
-#if HAVE_GDK_PIXBUF
 cairo_surface_t* gdk_cairo_image_surface_create_from_pixbuf(const GdkPixbuf *gdkbuf) {
 	int chan = gdk_pixbuf_get_n_channels(gdkbuf);
 	if (chan < 3) {
@@ -123,4 +120,3 @@ cairo_surface_t* gdk_cairo_image_surface_create_from_pixbuf(const GdkPixbuf *gdk
 	cairo_surface_mark_dirty(cs);
 	return cs;
 }
-#endif // HAVE_GDK_PIXBUF
