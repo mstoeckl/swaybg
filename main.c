@@ -14,6 +14,7 @@
 #include "pool-buffer.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
+#include "fullscreen-shell-unstable-v1-client-protocol.h"
 
 static uint32_t parse_color(const char *color) {
 	if (color[0] == '#') {
@@ -38,6 +39,7 @@ struct swaybg_state {
 	struct wl_compositor *compositor;
 	struct wl_shm *shm;
 	struct zwlr_layer_shell_v1 *layer_shell;
+	struct zwp_fullscreen_shell_v1 *fullscreen_shell;
 	struct zxdg_output_manager_v1 *xdg_output_manager;
 	struct wl_list configs;  // struct swaybg_output_config::link
 	struct wl_list outputs;  // struct swaybg_output::link
@@ -223,7 +225,13 @@ static void output_geometry(void *data, struct wl_output *output, int32_t x,
 
 static void output_mode(void *data, struct wl_output *output, uint32_t flags,
 		int32_t width, int32_t height, int32_t refresh) {
-	// Who cares
+	struct swaybg_output *sb_output = data;
+	if (!sb_output->state->layer_shell && sb_output->state->fullscreen_shell
+		&& sb_output->state->run_display) {
+		sb_output->width = width;
+		sb_output->height = height;
+		sb_output->dirty = true;
+	}
 }
 
 static void output_done(void *data, struct wl_output *output) {
@@ -312,20 +320,30 @@ static void create_layer_surface(struct swaybg_output *output) {
 	wl_surface_set_input_region(output->surface, input_region);
 	wl_region_destroy(input_region);
 
-	output->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-			output->state->layer_shell, output->surface, output->wl_output,
-			ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "wallpaper");
-	assert(output->layer_surface);
+	if (output->state->layer_shell) {
+		output->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+				output->state->layer_shell, output->surface, output->wl_output,
+				ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "wallpaper");
+		assert(output->layer_surface);
 
-	zwlr_layer_surface_v1_set_size(output->layer_surface, 0, 0);
-	zwlr_layer_surface_v1_set_anchor(output->layer_surface,
-			ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-			ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
-			ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
-			ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
-	zwlr_layer_surface_v1_set_exclusive_zone(output->layer_surface, -1);
-	zwlr_layer_surface_v1_add_listener(output->layer_surface,
-			&layer_surface_listener, output);
+		zwlr_layer_surface_v1_set_size(output->layer_surface, 0, 0);
+		zwlr_layer_surface_v1_set_anchor(output->layer_surface,
+				ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+				ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
+				ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+				ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+		zwlr_layer_surface_v1_set_exclusive_zone(output->layer_surface, -1);
+		zwlr_layer_surface_v1_add_listener(output->layer_surface,
+				&layer_surface_listener, output);
+	} else if (output->state->fullscreen_shell) {
+		zwp_fullscreen_shell_v1_present_surface(
+			output->state->fullscreen_shell,
+			output->surface,
+			ZWP_FULLSCREEN_SHELL_V1_PRESENT_METHOD_DEFAULT,
+			output->wl_output);
+	} else {
+		assert(0);
+	}
 	wl_surface_commit(output->surface);
 }
 
@@ -377,6 +395,9 @@ static void handle_global(void *data, struct wl_registry *registry,
 	} else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
 		state->layer_shell =
 			wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, 1);
+	} else if (strcmp(interface, zwp_fullscreen_shell_v1_interface.name) == 0) {
+		state->fullscreen_shell =
+			wl_registry_bind(registry, name, &zwp_fullscreen_shell_v1_interface, 1);
 	} else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
 		state->xdg_output_manager = wl_registry_bind(registry, name,
 			&zxdg_output_manager_v1_interface, 2);
@@ -578,7 +599,8 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	if (state.compositor == NULL || state.shm == NULL ||
-			state.layer_shell == NULL || state.xdg_output_manager == NULL) {
+			(state.layer_shell == NULL && state.fullscreen_shell == NULL) ||
+			state.xdg_output_manager == NULL) {
 		swaybg_log(LOG_ERROR, "Missing a required Wayland interface");
 		return 1;
 	}
