@@ -31,6 +31,7 @@ wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 wayland_scanner = dependency('wayland-scanner', version: '>=1.14.91', native: true)
 cairo = dependency('cairo')
 gdk_pixbuf = dependency('gdk-pixbuf-2.0', required: get_option('gdk-pixbuf'))
+openexr = dependency('OpenEXR')
 
 git = find_program('git', required: false, native: true)
 scdoc = find_program('scdoc', required: get_option('man-pages'), native: true)
@@ -96,6 +97,7 @@ dependencies = [
 	client_protos,
 	gdk_pixbuf,
 	wayland_client,
+	openexr,
 ]
 
 sources = [
