@@ -7,10 +7,9 @@
 
 struct pool_buffer {
 	struct wl_buffer *buffer;
-	cairo_surface_t *surface;
-	cairo_t *cairo;
 	void *data;
 	size_t size;
+	int stride;
 };
 
 bool create_buffer(struct pool_buffer *buffer, struct wl_shm *shm,

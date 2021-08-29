@@ -42,6 +42,7 @@ struct swaybg_state {
 	struct wl_list configs;  // struct swaybg_output_config::link
 	struct wl_list outputs;  // struct swaybg_output::link
 	struct wl_list images;   // struct swaybg_image::link
+	uint32_t highest_depth_format;
 	bool run_display;
 };
 
@@ -100,16 +101,102 @@ bool is_valid_color(const char *color) {
 	return true;
 }
 
+
+/* taken from pixman which copied off Mesa ; can be replaced if pixman
+ * ever merges its float16 patch */
+static uint16_t
+convert_float_to_half(float f)
+{
+	uint32_t sign_mask  = 0x80000000;
+	uint32_t round_mask = ~0xfff;
+	uint32_t f32inf = 0xff << 23;
+	uint32_t f16inf = 0x1f << 23;
+	uint32_t sign;
+	union {
+		float f;
+		uint32_t ui;
+	} magic, f32;
+	uint16_t f16;
+
+	magic.ui = 0xf << 23;
+
+	 f32.f = f;
+
+	/* Sign */
+	sign = f32.ui & sign_mask;
+	f32.ui ^= sign;
+
+	if (f32.ui == f32inf) {
+		/* Inf */
+		f16 = 0x7c00;
+	} else if (f32.ui > f32inf) {
+		/* NaN */
+		f16 = 0x7e00;
+	} else {
+		/* Number */
+		f32.ui &= round_mask;
+		f32.f  *= magic.f;
+		f32.ui -= round_mask;
+		/*
+		 * XXX: The magic mul relies on denorms being available, otherwise all
+		 * f16 denorms get flushed to zero.
+		 */
+		/*
+		 * Clamp to max finite value if overflowed.
+		 * OpenGL has completely undefined rounding behavior for float to
+		 * half-float conversions, and this matches what is mandated for float
+		 * to fp11/fp10, which recommend round-to-nearest-finite too.
+		 * (d3d10 is deeply unhappy about flushing such values to infinity, and
+		 * while it also mandates round-to-zero it doesn't care nearly as much
+		 * about that.)
+		 *
+		 * pixman doesn't have any preconceptions, so let's do what Mesa does.
+		 */
+		if (f32.ui > f16inf)
+			f32.ui = f16inf - 1;
+
+		f16 = f32.ui >> 13;
+	}
+
+	/* Sign */
+	f16 |= sign >> 16;
+
+	return f16;
+}
+
 static void render_frame(struct swaybg_output *output, cairo_surface_t *surface) {
 	int buffer_width = output->width * output->scale,
 		buffer_height = output->height * output->scale;
+
 	struct pool_buffer buffer;
 	if (!create_buffer(&buffer, output->state->shm,
-			buffer_width, buffer_height, WL_SHM_FORMAT_ARGB8888)) {
+			buffer_width, buffer_height, output->state->highest_depth_format)) {
 		return;
 	}
+	uint8_t *data;
+	cairo_format_t format;
+	int stride;
+	if (output->state->highest_depth_format == WL_SHM_FORMAT_XBGR16161616F) {
+		data = calloc(buffer_height, buffer_width * 12);
+		format = CAIRO_FORMAT_RGB96F;
+		stride = 12 * buffer_width;
+	} else if (output->state->highest_depth_format == WL_SHM_FORMAT_XBGR2101010) {
+		// todo: this needs R,B swap
+		data = buffer.data;
+		format = CAIRO_FORMAT_RGB30;
+		stride = buffer.stride;
+	} else {
+		data = buffer.data;
+		format = CAIRO_FORMAT_RGB24;
+		stride = buffer.stride;
+	}
 
-	cairo_t *cairo = buffer.cairo;
+	cairo_surface_t *dest = cairo_image_surface_create_for_data(data,
+			format, buffer_width, buffer_height, stride);
+	if (cairo_surface_status(dest) != CAIRO_STATUS_SUCCESS) {
+		swaybg_log(LOG_ERROR, "Failed to make surface\n");
+	}
+	cairo_t *cairo = cairo_create(dest);
 	cairo_save(cairo);
 	cairo_set_operator(cairo, CAIRO_OPERATOR_CLEAR);
 	cairo_paint(cairo);
@@ -128,6 +215,28 @@ static void render_frame(struct swaybg_output *output, cairo_surface_t *surface)
 				output->config->mode, buffer_width, buffer_height);
 		}
 	}
+
+	if (output->state->highest_depth_format == WL_SHM_FORMAT_XBGR16161616F) {
+		float *fdata = (float *)data;
+		for (int y = 0; y < buffer_height; y++) {
+			uint64_t *row = (uint64_t *)((uint8_t*)buffer.data + buffer.stride * y);
+			for (int x = 0; x < buffer_width; x++) {
+				float r = fdata[y * buffer_width * 3 + 3 * x + 0];
+				float g = fdata[y * buffer_width * 3 + 3 * x + 1];
+				float b = fdata[y * buffer_width * 3 + 3 * x + 2];
+				uint64_t ur = convert_float_to_half(r);
+				uint64_t ug = convert_float_to_half(g);
+				uint64_t ub = convert_float_to_half(b);
+				row[x] = (ur << 0) | (ub << 32) | (ug << 16);
+			}
+		}
+		/* TODO: do a transfer */
+		free(data);
+	}
+
+	cairo_destroy(cairo);
+	cairo_surface_destroy(dest);
+
 
 	wl_surface_set_buffer_scale(output->surface, output->scale);
 	wl_surface_attach(output->surface, buffer.buffer, 0, 0);
@@ -190,10 +299,36 @@ static void layer_surface_closed(void *data,
 			output->name, output->identifier);
 	destroy_swaybg_output(output);
 }
-
 static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 	.configure = layer_surface_configure,
 	.closed = layer_surface_closed,
+};
+
+static void shm_format(void *data, struct wl_shm *wl_shm, uint32_t format) {
+	struct swaybg_state *state = data;
+	/* Since background images are typically only rendered once, always
+	 * prefer the highest bit depth provided */
+	uint32_t order[] = {
+		WL_SHM_FORMAT_XRGB8888,
+		WL_SHM_FORMAT_XBGR2101010,
+		WL_SHM_FORMAT_XBGR16161616F
+	};
+	size_t old_rank = 0, this_rank = 0;
+	for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+		if (order[i] == state->highest_depth_format) {
+			old_rank = i;
+		}
+		if (order[i] == format) {
+			this_rank = i;
+		}
+	}
+	if (this_rank > old_rank) {
+		state->highest_depth_format = format;
+	}
+}
+
+static const struct wl_shm_listener shm_listener = {
+	.format = shm_format,
 };
 
 static void output_geometry(void *data, struct wl_output *output, int32_t x,
@@ -340,6 +475,7 @@ static void handle_global(void *data, struct wl_registry *registry,
 			wl_registry_bind(registry, name, &wl_compositor_interface, 4);
 	} else if (strcmp(interface, wl_shm_interface.name) == 0) {
 		state->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+		wl_shm_add_listener(state->shm, &shm_listener, state);
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
 		struct swaybg_output *output = calloc(1, sizeof(struct swaybg_output));
 		output->state = state;
@@ -516,6 +652,7 @@ int main(int argc, char **argv) {
 	swaybg_log_init(LOG_DEBUG);
 
 	struct swaybg_state state = {0};
+	state.highest_depth_format = WL_SHM_FORMAT_XRGB8888;
 	wl_list_init(&state.configs);
 	wl_list_init(&state.outputs);
 	wl_list_init(&state.images);
