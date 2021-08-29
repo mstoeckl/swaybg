@@ -14,7 +14,7 @@ struct pool_buffer {
 };
 
 bool create_buffer(struct pool_buffer *buffer, struct wl_shm *shm,
-		int32_t width, int32_t height, uint32_t format);
+		int32_t width, int32_t height);
 void destroy_buffer(struct pool_buffer *buffer);
 
 #endif
