@@ -101,6 +101,14 @@ bool is_valid_color(const char *color) {
 	return true;
 }
 
+static float linear_to_srgb(float x) {
+	if (x < 0.0031308f) {
+		return 12.92f * x;
+	} else {
+		return (1.f + 0.055f) * powf(x, 1.f / 2.4f) - 0.055f;
+	}
+}
+
 
 /* taken from pixman which copied off Mesa ; can be replaced if pixman
  * ever merges its float16 patch */
@@ -224,6 +232,9 @@ static void render_frame(struct swaybg_output *output, cairo_surface_t *surface)
 				float r = fdata[y * buffer_width * 3 + 3 * x + 0];
 				float g = fdata[y * buffer_width * 3 + 3 * x + 1];
 				float b = fdata[y * buffer_width * 3 + 3 * x + 2];
+				r = linear_to_srgb(r);
+				g = linear_to_srgb(g);
+				b = linear_to_srgb(b);
 				uint64_t ur = convert_float_to_half(r);
 				uint64_t ug = convert_float_to_half(g);
 				uint64_t ub = convert_float_to_half(b);
