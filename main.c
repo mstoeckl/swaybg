@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <getopt.h>
+#include <gegl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -499,6 +500,10 @@ static void parse_command_line(int argc, char **argv,
 int main(int argc, char **argv) {
 	swaybg_log_init(LOG_DEBUG);
 
+	gint gegl_argc = 0;
+	gchar **gegl_argv = NULL;
+	gegl_init(&gegl_argc, &gegl_argv);
+
 	struct swaybg_state state = {0};
 	wl_list_init(&state.configs);
 	wl_list_init(&state.outputs);
@@ -616,6 +621,8 @@ int main(int argc, char **argv) {
 	wl_list_for_each_safe(image, tmp_image, &state.images, link) {
 		destroy_swaybg_image(image);
 	}
+
+	gegl_exit();
 
 	return 0;
 }

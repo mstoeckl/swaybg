@@ -30,8 +30,8 @@ wayland_client = dependency('wayland-client')
 wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 wayland_scanner = dependency('wayland-scanner', version: '>=1.14.91', native: true)
 cairo = dependency('cairo')
+babl = dependency('babl')
 gegl = dependency('gegl-0.4')
-gdk_pixbuf = dependency('gdk-pixbuf-2.0', required: get_option('gdk-pixbuf'))
 
 git = find_program('git', required: false, native: true)
 scdoc = find_program('scdoc', required: get_option('man-pages'), native: true)
@@ -47,7 +47,6 @@ endif
 
 add_project_arguments([
 	'-DSWAYBG_VERSION=@0@'.format(version),
-	'-DHAVE_GDK_PIXBUF=@0@'.format(gdk_pixbuf.found().to_int()),
 ], language: 'c')
 
 wl_protocol_dir = wayland_protos.get_variable('pkgdatadir')
@@ -93,7 +92,7 @@ client_protos = declare_dependency(
 dependencies = [
 	cairo,
 	client_protos,
-	gdk_pixbuf,
+	babl,
 	gegl,
 	wayland_client,
 ]

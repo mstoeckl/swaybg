@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <gegl.h>
+
 #include "background-image.h"
 #include "cairo_util.h"
 #include "log.h"
@@ -22,33 +24,48 @@ enum background_mode parse_background_mode(const char *mode) {
 }
 
 cairo_surface_t *load_background_image(const char *path) {
-	cairo_surface_t *image;
-#if HAVE_GDK_PIXBUF
-	GError *err = NULL;
-	GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(path, &err);
-	if (!pixbuf) {
-		swaybg_log(LOG_ERROR, "Failed to load background image (%s).",
-				err->message);
+	GeglNode *graph = gegl_node_new();
+	if (!graph) {
+		swaybg_log(LOG_ERROR, "Failed to allocate graph\n");
+	}
+	GeglNode *load = gegl_node_new_child (graph,
+		"operation", "gegl:load", "path", path, NULL);
+	if (!load) {
+		swaybg_log(LOG_ERROR, "Failed to create load op\n");
+	}
+	const Babl* bablfmt = babl_format("B'aG'aR'aA u8");
+	if (!bablfmt) {
+		swaybg_log(LOG_ERROR, "Failed to create babl format\n");
 		return NULL;
 	}
-	image = gdk_cairo_image_surface_create_from_pixbuf(pixbuf);
-	g_object_unref(pixbuf);
-#else
-	image = cairo_image_surface_create_from_png(path);
-#endif // HAVE_GDK_PIXBUF
-	if (!image) {
-		swaybg_log(LOG_ERROR, "Failed to read background image.");
+	GeglBuffer *buffer = NULL;
+	GeglNode *sink = gegl_node_new_child (graph,
+		"operation", "gegl:buffer-sink", "buffer", &buffer,
+		"format", bablfmt,
+		NULL);
+	if (!sink) {
+		swaybg_log(LOG_ERROR, "Failed to create sink op\n");
+	}
+	gegl_node_link_many (load, sink, NULL);
+	gegl_node_process (sink);
+	if (!buffer) {
+		swaybg_log(LOG_ERROR, "Failed to load buffer\n");
 		return NULL;
 	}
-	if (cairo_surface_status(image) != CAIRO_STATUS_SUCCESS) {
-		swaybg_log(LOG_ERROR, "Failed to read background image: %s."
-#if !HAVE_GDK_PIXBUF
-				"\nSway was compiled without gdk_pixbuf support, so only"
-				"\nPNG images can be loaded. This is the likely cause."
-#endif // !HAVE_GDK_PIXBUF
-				, cairo_status_to_string(cairo_surface_status(image)));
-		return NULL;
-	}
+	const GeglRectangle *rect = gegl_buffer_get_extent(buffer);
+	const Babl *fmt = gegl_buffer_get_format(buffer);
+
+	cairo_surface_t *image = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, rect->width, rect->height);
+	gegl_buffer_get(buffer, NULL, 1.0, fmt, cairo_image_surface_get_data(image),
+			cairo_image_surface_get_stride(image), GEGL_ABYSS_NONE);
+
+	cairo_surface_mark_dirty(image);
+
+	g_object_unref(buffer);
+	g_object_unref(load);
+	g_object_unref(sink);
+	g_object_unref(graph);
+
 	return image;
 }
 
