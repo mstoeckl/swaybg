@@ -30,6 +30,7 @@ wayland_client = dependency('wayland-client')
 wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 wayland_scanner = dependency('wayland-scanner', version: '>=1.14.91', native: true)
 cairo = dependency('cairo')
+gegl = dependency('gegl-0.4')
 gdk_pixbuf = dependency('gdk-pixbuf-2.0', required: get_option('gdk-pixbuf'))
 
 git = find_program('git', required: false, native: true)
@@ -93,6 +94,7 @@ dependencies = [
 	cairo,
 	client_protos,
 	gdk_pixbuf,
+	gegl,
 	wayland_client,
 ]
 
