@@ -29,7 +29,6 @@ endif
 wayland_client = dependency('wayland-client')
 wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 wayland_scanner = dependency('wayland-scanner', version: '>=1.14.91', native: true)
-cairo = dependency('cairo')
 babl = dependency('babl')
 gegl = dependency('gegl-0.4')
 
@@ -90,7 +89,6 @@ client_protos = declare_dependency(
 )
 
 dependencies = [
-	cairo,
 	client_protos,
 	babl,
 	gegl,
@@ -99,7 +97,6 @@ dependencies = [
 
 sources = [
 	'background-image.c',
-	'cairo.c',
 	'log.c',
 	'main.c',
 	'pool-buffer.c',

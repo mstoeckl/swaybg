@@ -1,6 +1,5 @@
 #define _POSIX_C_SOURCE 200809
 #include <assert.h>
-#include <cairo.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,8 +57,7 @@ static int create_pool_file(size_t size, char **name) {
 }
 
 bool create_buffer(struct pool_buffer *buf, struct wl_shm *shm,
-		int32_t width, int32_t height, uint32_t format) {
-	uint32_t stride = width * 4;
+		int32_t width, int32_t height, int32_t stride, uint32_t format) {
 	size_t size = stride * height;
 
 	char *name;
@@ -77,21 +75,12 @@ bool create_buffer(struct pool_buffer *buf, struct wl_shm *shm,
 
 	buf->size = size;
 	buf->data = data;
-	buf->surface = cairo_image_surface_create_for_data(data,
-			CAIRO_FORMAT_ARGB32, width, height, stride);
-	buf->cairo = cairo_create(buf->surface);
 	return true;
 }
 
 void destroy_buffer(struct pool_buffer *buffer) {
 	if (buffer->buffer) {
 		wl_buffer_destroy(buffer->buffer);
-	}
-	if (buffer->cairo) {
-		cairo_destroy(buffer->cairo);
-	}
-	if (buffer->surface) {
-		cairo_surface_destroy(buffer->surface);
 	}
 	if (buffer->data) {
 		munmap(buffer->data, buffer->size);

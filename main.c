@@ -10,7 +10,6 @@
 #include <strings.h>
 #include <wayland-client.h>
 #include "background-image.h"
-#include "cairo_util.h"
 #include "log.h"
 #include "pool-buffer.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
@@ -37,6 +36,8 @@ struct swaybg_state {
 	struct wl_display *display;
 	struct wl_compositor *compositor;
 	struct wl_shm *shm;
+	bool has_abgr16f;
+	const Babl* fmt_abgr16f;
 	struct zwlr_layer_shell_v1 *layer_shell;
 	struct wl_list configs;  // struct swaybg_output_config::link
 	struct wl_list outputs;  // struct swaybg_output::link
@@ -99,7 +100,7 @@ bool is_valid_color(const char *color) {
 	return true;
 }
 
-static void render_frame(struct swaybg_output *output, cairo_surface_t *surface) {
+static void render_frame(struct swaybg_output *output, GeglBuffer *surface) {
 	int buffer_width = output->width * output->scale,
 		buffer_height = output->height * output->scale;
 
@@ -115,31 +116,65 @@ static void render_frame(struct swaybg_output *output, cairo_surface_t *surface)
 		}
 		return;
 	}
+
+	bool use_high_bit_depth = false;
+	if (surface) {
+		const Babl *surf_fmt = gegl_buffer_get_format(surface);
+		int components = babl_format_get_n_components(surf_fmt);
+		for (int i=0;i<components;i++) {
+			const Babl *ex_comp = babl_format_get_type(surf_fmt, 0);
+			use_high_bit_depth = use_high_bit_depth || (ex_comp != babl_type("u8"));
+		}
+	}
+
+	int32_t buffer_stride;
+	const Babl* bablfmt;
+	uint32_t shm_format;
+	if (output->state->has_abgr16f && use_high_bit_depth) {
+		buffer_stride = buffer_width * 8;
+		shm_format = WL_SHM_FORMAT_ABGR16161616F;
+		bablfmt = output->state->fmt_abgr16f;
+	} else {
+		buffer_stride = buffer_width * 4;
+		shm_format = WL_SHM_FORMAT_ARGB8888;
+		bablfmt = babl_format("B'aG'aR'aA u8");
+		if (!bablfmt) {
+			swaybg_log(LOG_ERROR, "Failed to create babl format\n");
+			return;
+		}
+	}
+
 	struct pool_buffer buffer;
 	if (!create_buffer(&buffer, output->state->shm,
-			buffer_width, buffer_height, WL_SHM_FORMAT_ARGB8888)) {
+			buffer_width, buffer_height, buffer_stride, shm_format)) {
 		return;
 	}
 
-	cairo_t *cairo = buffer.cairo;
-	cairo_save(cairo);
-	cairo_set_operator(cairo, CAIRO_OPERATOR_CLEAR);
-	cairo_paint(cairo);
-	cairo_restore(cairo);
-	if (output->config->mode == BACKGROUND_MODE_SOLID_COLOR) {
-		cairo_set_source_u32(cairo, output->config->color);
-		cairo_paint(cairo);
-	} else {
-		if (output->config->color) {
-			cairo_set_source_u32(cairo, output->config->color);
-			cairo_paint(cairo);
-		}
-
-		if (surface) {
-			render_background_image(cairo, surface,
-				output->config->mode, buffer_width, buffer_height);
-		}
+	GeglColor *bg_color = gegl_color_new("black");
+	if (!bg_color) {
+		swaybg_log(LOG_ERROR, "Failed to create color\n");
 	}
+	float r = (output->config->color >> (3*8) & 0xFF) / 255.0;
+	float g = (output->config->color >> (2*8) & 0xFF) / 255.0;
+	float b = (output->config->color >> (1*8) & 0xFF) / 255.0;
+	float a = 1.0; // override, must be opaque
+	gegl_color_set_rgba(bg_color, r, g, b, a);
+
+	GeglBuffer *dest = render_background_image(surface, bg_color, bablfmt,
+		output->config->mode, buffer_width, buffer_height);
+
+	GeglRectangle rect = {.x = 0, .y = 0, .width = buffer_width, .height = buffer_height};
+	const GeglRectangle *actual_rect = gegl_buffer_get_extent(dest);
+	if (actual_rect->x != 0 || actual_rect->y != 0 || actual_rect->width != buffer_width || actual_rect->height != buffer_height) {
+		swaybg_log(LOG_ERROR, "incorrect background image size: %d %d %d %d, expected 0,0,%d,%d",
+			actual_rect->x, actual_rect->y,actual_rect->width, actual_rect->height, buffer_width, buffer_height);
+
+	}
+	gegl_buffer_get(dest, &rect, 1.0, bablfmt, buffer.data,
+			buffer_stride, GEGL_ABYSS_NONE);
+
+	g_object_unref(dest);
+	g_object_unref(bg_color);
 
 	wl_surface_set_buffer_scale(output->surface, output->scale);
 	wl_surface_attach(output->surface, buffer.buffer, 0, 0);
@@ -327,6 +362,17 @@ static const struct wl_output_listener output_listener = {
 	.description = output_description,
 };
 
+static void shm_handle_format(void *data, struct wl_shm *wl_shm, uint32_t format) {
+	struct swaybg_state *state = data;
+	if (format == WL_SHM_FORMAT_ABGR16161616F) {
+		state->has_abgr16f = true;
+	}
+}
+
+static const struct wl_shm_listener shm_listener = {
+	.format = shm_handle_format,
+};
+
 static void handle_global(void *data, struct wl_registry *registry,
 		uint32_t name, const char *interface, uint32_t version) {
 	struct swaybg_state *state = data;
@@ -335,6 +381,7 @@ static void handle_global(void *data, struct wl_registry *registry,
 			wl_registry_bind(registry, name, &wl_compositor_interface, 4);
 	} else if (strcmp(interface, wl_shm_interface.name) == 0) {
 		state->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+		wl_shm_add_listener(state->shm, &shm_listener, state);
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
 		struct swaybg_output *output = calloc(1, sizeof(struct swaybg_output));
 		output->state = state;
@@ -508,6 +555,9 @@ int main(int argc, char **argv) {
 	wl_list_init(&state.configs);
 	wl_list_init(&state.outputs);
 	wl_list_init(&state.images);
+	state.fmt_abgr16f = babl_format_new (babl_model ("R'G'B'A"), babl_type ("half"),
+		babl_component ("R'"), babl_component ("G'"), babl_component ("B'"), babl_component ("A"),
+		NULL);
 
 	parse_command_line(argc, argv, &state);
 
@@ -581,7 +631,7 @@ int main(int argc, char **argv) {
 				continue;
 			}
 
-			cairo_surface_t *surface = load_background_image(image->path);
+			GeglBuffer *surface = load_background_image(image->path);
 			if (!surface) {
 				swaybg_log(LOG_ERROR, "Failed to load image: %s", image->path);
 				continue;
@@ -595,7 +645,7 @@ int main(int argc, char **argv) {
 			}
 
 			image->load_required = false;
-			cairo_surface_destroy(surface);
+			g_object_unref(surface);
 		}
 
 		// Redraw outputs without associated image
