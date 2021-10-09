@@ -53,17 +53,15 @@ GeglBuffer *load_background_image(const char *path) {
 	return buffer;
 }
 
-GeglBuffer *render_background_image(GeglBuffer *image, GeglColor *bg_color,
-		const Babl* output_fmt, enum background_mode mode,
-		int buffer_width, int buffer_height) {
+bool render_background_image(GeglBuffer *out, GeglBuffer *image,
+		GeglColor *bg_color, enum background_mode mode) {
+	const GeglRectangle *out_rect = gegl_buffer_get_extent(out);
+	int buffer_width = out_rect->width, buffer_height = out_rect->height;
 
-	// Inputs: bg_color;
-	// Process: transform and blend
-	// Output: in output_fmt
 	GeglNode *graph = gegl_node_new();
 	if (!graph) {
 		swaybg_log(LOG_ERROR, "Failed to allocate graph\n");
-		return NULL;
+		return false;
 	}
 
 	GeglNode *load_color = gegl_node_new_child (graph,
@@ -71,11 +69,8 @@ GeglBuffer *render_background_image(GeglBuffer *image, GeglColor *bg_color,
 	double crop_x = 0, crop_y = 0, crop_width = buffer_width, crop_height = buffer_height;
 	GeglNode *crop_color = gegl_node_new_child (graph,
 		"operation", "gegl:crop", "x", crop_x, "y", crop_y, "width", crop_width, "height", crop_height, NULL);
-	GeglBuffer *dest = NULL;
 	GeglNode *sink = gegl_node_new_child (graph,
-		"operation", "gegl:buffer-sink", "buffer", &dest,
-		"format", output_fmt,
-		NULL);
+		"operation", "gegl:write-buffer", "buffer", out, NULL);
 	gegl_node_link(load_color, crop_color);
 
 	GeglNode *load_img = NULL, *proc_scale = NULL, *proc_translate = NULL,
@@ -204,5 +199,6 @@ cleanup:
 		g_object_unref(sink);
 	}
 	g_object_unref(graph);
-	return dest;
+
+	return true;
 }

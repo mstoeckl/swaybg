@@ -160,8 +160,20 @@ static void render_frame(struct swaybg_output *output, GeglBuffer *surface) {
 	float a = 1.0; // override, must be opaque
 	gegl_color_set_rgba(bg_color, r, g, b, a);
 
-	GeglBuffer *dest = render_background_image(surface, bg_color, bablfmt,
-		output->config->mode, buffer_width, buffer_height);
+	GeglRectangle dest_extent = {
+		.x = 0, .y = 0,
+		.width = buffer_width, .height = buffer_height
+	};
+	GeglBuffer *dest = gegl_buffer_linear_new_from_data(
+		buffer.data, bablfmt, &dest_extent, buffer_stride, NULL, NULL);
+	if (!dest) {
+		swaybg_log(LOG_ERROR, "failed to create destination buffer");
+	}
+
+	if (!render_background_image(dest, surface,
+			bg_color, output->config->mode)) {
+		swaybg_log(LOG_ERROR, "failed to render background image");
+	}
 
 	GeglRectangle rect = {.x = 0, .y = 0, .width = buffer_width, .height = buffer_height};
 	const GeglRectangle *actual_rect = gegl_buffer_get_extent(dest);
