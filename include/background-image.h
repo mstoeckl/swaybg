@@ -14,6 +14,8 @@ enum background_mode {
 	BACKGROUND_MODE_INVALID,
 };
 
+void load_gegl_module_library(const char *name);
+
 enum background_mode parse_background_mode(const char *mode);
 GeglBuffer *load_background_image(const char *path);
 bool render_background_image(GeglBuffer *out, GeglBuffer *image,

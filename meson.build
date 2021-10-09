@@ -44,8 +44,11 @@ if git.found()
 	endif
 endif
 
+gegl_plugin_folder = gegl.get_variable(pkgconfig : 'pluginsdir')
+
 add_project_arguments([
 	'-DSWAYBG_VERSION=@0@'.format(version),
+	'-DGEGL_PLUGIN_FOLDER="@0@"'.format(gegl_plugin_folder),
 ], language: 'c')
 
 wl_protocol_dir = wayland_protos.get_variable('pkgdatadir')

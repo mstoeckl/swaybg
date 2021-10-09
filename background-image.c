@@ -1,6 +1,10 @@
+#define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <gegl.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "background-image.h"
 #include "log.h"
@@ -23,27 +27,129 @@ enum background_mode parse_background_mode(const char *mode) {
 	return BACKGROUND_MODE_INVALID;
 }
 
+void load_gegl_module_library(const char *name) {
+	const char *plugin_folder = GEGL_PLUGIN_FOLDER;
+
+	const char *xdg_runtime_dir = getenv("XDG_RUNTIME_DIR");
+	char src_path[256];
+	char dest_folder[256];
+	char dest_path[256];
+	sprintf(dest_folder, "%s/swaybg_gegl_hack_%s", xdg_runtime_dir, name);
+	sprintf(dest_path, "%s/swaybg_gegl_hack_%s/plugin.so", xdg_runtime_dir, name);
+	sprintf(src_path, "%s/%s", plugin_folder, name);
+
+	if (mkdir(dest_folder, S_IRWXU) == -1 && errno != EEXIST) {
+		swaybg_log(LOG_ERROR, "Failed to create plugin folder %s", plugin_folder);
+	}
+
+	if (symlink(src_path, dest_path) == -1 && errno != EEXIST) {
+		swaybg_log(LOG_ERROR, "Failed to create plugin link %s", dest_path);
+	}
+
+	struct timespec t1, t2;
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	gegl_load_module_directory(dest_folder);
+	clock_gettime(CLOCK_MONOTONIC, &t2);
+	double msec = 1e3 * (t2.tv_sec - t1.tv_sec) + 1e-6 * (t2.tv_nsec - t1.tv_nsec);
+	swaybg_log(LOG_ERROR, "Loading module %s took %f msec", name, msec);
+}
+
+enum image_type {
+	IMAGE_TYPE_PNG,
+	IMAGE_TYPE_JPG,
+	IMAGE_TYPE_EXR,
+	IMAGE_TYPE_WEBP,
+	IMAGE_TYPE_GIF,
+	IMAGE_TYPE_PPM,
+	IMAGE_TYPE_TIFF,
+	IMAGE_TYPE_SVG,
+
+	IMAGE_TYPE_UNKNOWN // this must always be the last entry
+};
+static const char *module_names[IMAGE_TYPE_UNKNOWN] = {
+	"png-load.so",
+	"jpg-load.so",
+	"exr-load.so",
+	"webp-load.so",
+	"gif-load.so",
+	"ppm-load.so",
+	"tiff-load.so",
+	"svg-load.so",
+};
+static const char *op_names[IMAGE_TYPE_UNKNOWN] = {
+	"gegl:png-load",
+	"gegl:jpg-load",
+	"gegl:exr-load",
+	"gegl:webp-load",
+	"gegl:gif-load",
+	"gegl:ppm-load",
+	"gegl:tiff-load",
+	"gegl:svg-load",
+};
+
+static enum image_type guess_image_type(const char *path) {
+	char *dot = strrchr(path, '.');
+	if (!dot) {
+		return IMAGE_TYPE_UNKNOWN;
+	}
+	dot += 1;
+	if (strcmp(dot, "png") == 0 || strcmp(dot, "PNG") == 0) {
+		return IMAGE_TYPE_PNG;
+	} else if (strcmp(dot, "jpg") == 0 || strcmp(dot, "JPG") == 0) {
+		return IMAGE_TYPE_JPG;
+	} else if (strcmp(dot, "exr") == 0 || strcmp(dot, "EXR") == 0) {
+		return IMAGE_TYPE_EXR;
+	}else if (strcmp(dot, "webp") == 0 || strcmp(dot, "WEBP") == 0) {
+		return IMAGE_TYPE_WEBP;
+	}else if (strcmp(dot, "gif") == 0 || strcmp(dot, "GIF") == 0) {
+		return IMAGE_TYPE_GIF;
+	}else if (strcmp(dot, "ppm") == 0 || strcmp(dot, "PPM") == 0) {
+		return IMAGE_TYPE_PPM;
+	}else if (strcmp(dot, "tiff") == 0 || strcmp(dot, "TIFF") == 0 ||
+			strcmp(dot, "tif") == 0 || strcmp(dot, "TIF") == 0) {
+		return IMAGE_TYPE_TIFF;
+	}else if (strcmp(dot, "svg") == 0 || strcmp(dot, "SVG") == 0) {
+		return IMAGE_TYPE_SVG;
+	}
+	swaybg_log(LOG_ERROR, "Unidentified image file ending: %s", dot);
+	return IMAGE_TYPE_UNKNOWN;
+}
+
 GeglBuffer *load_background_image(const char *path) {
+	static bool load_modules[IMAGE_TYPE_UNKNOWN] = {0};
+	enum image_type type = guess_image_type(path);
+	if (type == IMAGE_TYPE_UNKNOWN) {
+		return NULL;
+	}
+	const char *module_name = module_names[type],
+		*op_name = op_names[type];
+	if (!load_modules[type]) {
+		load_gegl_module_library(module_name);
+		load_modules[type] = true;
+	}
+
 	GeglNode *graph = gegl_node_new();
 	if (!graph) {
-		swaybg_log(LOG_ERROR, "Failed to allocate graph\n");
+		swaybg_log(LOG_ERROR, "Failed to allocate graph");
 	}
+	// TODO: special handling would be helpful for SVG images, to pick the
+	// optimal size to render at
 	GeglNode *load = gegl_node_new_child (graph,
-		"operation", "gegl:load", "path", path, NULL);
+		"operation", op_name, "path", path, NULL);
 	if (!load) {
-		swaybg_log(LOG_ERROR, "Failed to create load op\n");
+		swaybg_log(LOG_ERROR, "Failed to create load op");
 	}
 	GeglBuffer *buffer = NULL;
 	GeglNode *sink = gegl_node_new_child (graph,
 		"operation", "gegl:buffer-sink", "buffer", &buffer,
 		NULL);
 	if (!sink) {
-		swaybg_log(LOG_ERROR, "Failed to create sink op\n");
+		swaybg_log(LOG_ERROR, "Failed to create sink op");
 	}
 	gegl_node_link_many (load, sink, NULL);
 	gegl_node_process (sink);
 	if (!buffer) {
-		swaybg_log(LOG_ERROR, "Failed to load buffer\n");
+		swaybg_log(LOG_ERROR, "Failed to load buffer");
 		return NULL;
 	}
 	g_object_unref(load);
@@ -60,9 +166,11 @@ bool render_background_image(GeglBuffer *out, GeglBuffer *image,
 
 	GeglNode *graph = gegl_node_new();
 	if (!graph) {
-		swaybg_log(LOG_ERROR, "Failed to allocate graph\n");
+		swaybg_log(LOG_ERROR, "Failed to allocate graph");
 		return false;
 	}
+
+	// TODO: optimizations for opaque images; use 'cast-format'?
 
 	GeglNode *load_color = gegl_node_new_child (graph,
 		"operation", "gegl:color", "value", bg_color, NULL);
@@ -77,7 +185,7 @@ bool render_background_image(GeglBuffer *out, GeglBuffer *image,
 		*proc_tile = NULL, *proc_cropimg = NULL, *proc_srcover = NULL;
 
 	if (!load_color || !crop_color || !sink) {
-		swaybg_log(LOG_ERROR, "Failed to create a GEGL node\n");
+		swaybg_log(LOG_ERROR, "Failed to create a GEGL node");
 		goto cleanup;
 	}
 
@@ -94,7 +202,7 @@ bool render_background_image(GeglBuffer *out, GeglBuffer *image,
 			"operation", "svg:src-over", NULL);
 
 		if (!load_img || !proc_tile || !proc_cropimg || !proc_srcover) {
-			swaybg_log(LOG_ERROR, "Failed to create tile node sequence\n");
+			swaybg_log(LOG_ERROR, "Failed to create tile node sequence");
 		}
 
 		gegl_node_link(load_img, proc_tile);
@@ -152,7 +260,7 @@ bool render_background_image(GeglBuffer *out, GeglBuffer *image,
 			"operation", "svg:src-over", NULL);
 
 		if (!load_img || !proc_scale || !proc_translate || !proc_cropimg || !proc_srcover) {
-			swaybg_log(LOG_ERROR, "Failed to create scale node sequence\n");
+			swaybg_log(LOG_ERROR, "Failed to create scale node sequence");
 		}
 
 		gegl_node_link(load_img, proc_scale);

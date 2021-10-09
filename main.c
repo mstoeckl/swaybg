@@ -170,10 +170,16 @@ static void render_frame(struct swaybg_output *output, GeglBuffer *surface) {
 		swaybg_log(LOG_ERROR, "failed to create destination buffer");
 	}
 
+	enum background_mode mode = surface ? output->config->mode : BACKGROUND_MODE_SOLID_COLOR;
+	struct timespec t1, t2;
+	clock_gettime(CLOCK_MONOTONIC, &t1);
 	if (!render_background_image(dest, surface,
-			bg_color, output->config->mode)) {
+			bg_color, mode)) {
 		swaybg_log(LOG_ERROR, "failed to render background image");
 	}
+	clock_gettime(CLOCK_MONOTONIC, &t2);
+	double msec = 1e3 * (t2.tv_sec - t1.tv_sec) + 1e-6 * (t2.tv_nsec - t1.tv_nsec);
+	swaybg_log(LOG_ERROR, "Rendering image at %d x %d took %f msec", buffer_width, buffer_height, msec);
 
 	GeglRectangle rect = {.x = 0, .y = 0, .width = buffer_width, .height = buffer_height};
 	const GeglRectangle *actual_rect = gegl_buffer_get_extent(dest);
@@ -559,9 +565,27 @@ static void parse_command_line(int argc, char **argv,
 int main(int argc, char **argv) {
 	swaybg_log_init(LOG_DEBUG);
 
-	gint gegl_argc = 0;
-	gchar **gegl_argv = NULL;
-	gegl_init(&gegl_argc, &gegl_argv);
+	g_object_set(gegl_config(),
+		"application-license", "MIT",
+		NULL);
+	/* Setting GEGL_PATH to empty prevents gegl from dlopening all of its
+	 * module files and then unloading them again, for the sake of learning
+	 * which operations they provide. Instead, we will load the specific
+	 * modules that we need at runtime; this is more brittle, but makes
+	 * startup much faster. */
+	setenv("GEGL_PATH", "", 1);
+	struct timespec t1, t2, t3;
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	babl_init();
+	clock_gettime(CLOCK_MONOTONIC, &t2);
+	gegl_init(NULL, NULL);
+	clock_gettime(CLOCK_MONOTONIC, &t3);
+	double msec_b = 1e3 * (t2.tv_sec - t1.tv_sec) + 1e-6 * (t2.tv_nsec - t1.tv_nsec);
+	double msec_g = 1e3 * (t3.tv_sec - t2.tv_sec) + 1e-6 * (t3.tv_nsec - t2.tv_nsec);
+	swaybg_log(LOG_ERROR, "Initializaing babl and gegl took %f and %f msec", msec_b, msec_g);
+	load_gegl_module_library("gegl-core.so");
+	load_gegl_module_library("gegl-common.so");
+	load_gegl_module_library("transformops.so");
 
 	struct swaybg_state state = {0};
 	wl_list_init(&state.configs);
@@ -632,7 +656,8 @@ int main(int argc, char **argv) {
 			bool buffer_change =
 				output->committed_height != buffer_height ||
 				output->committed_width != buffer_width;
-			if (output->dirty && output->config->image && buffer_change) {
+			if (output->dirty && output->config->image && buffer_change
+					&& output->config->mode != BACKGROUND_MODE_SOLID_COLOR) {
 				output->config->image->load_required = true;
 			}
 		}
@@ -642,12 +667,17 @@ int main(int argc, char **argv) {
 			if (!image->load_required) {
 				continue;
 			}
-
+			struct timespec t1, t2;
+			clock_gettime(CLOCK_MONOTONIC, &t1);
 			GeglBuffer *surface = load_background_image(image->path);
+			clock_gettime(CLOCK_MONOTONIC, &t2);
 			if (!surface) {
+				image->load_required = false;
 				swaybg_log(LOG_ERROR, "Failed to load image: %s", image->path);
 				continue;
 			}
+			double msec = 1e3 * (t2.tv_sec - t1.tv_sec) + 1e-6 * (t2.tv_nsec - t1.tv_nsec);
+			swaybg_log(LOG_ERROR, "Loaded image %s in %f msec", image->path, msec);
 
 			wl_list_for_each(output, &state.outputs, link) {
 				if (output->dirty && output->config->image == image) {
@@ -685,6 +715,7 @@ int main(int argc, char **argv) {
 	}
 
 	gegl_exit();
+	babl_exit();
 
 	return 0;
 }
