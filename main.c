@@ -579,7 +579,14 @@ int main(int argc, char **argv) {
 	}
 	if (state.compositor == NULL || state.shm == NULL ||
 			state.layer_shell == NULL || state.xdg_output_manager == NULL) {
-		swaybg_log(LOG_ERROR, "Missing a required Wayland interface");
+		swaybg_log(LOG_ERROR, "Missing a required Wayland interface, has: "
+			"wl_compositor %c wl_shm %c "
+			"zwlr_layer_shell_v1 %c zxdg_output_manager_v1 %c",
+			state.compositor ? 'Y' : 'n',
+			state.shm ? 'Y' : 'n',
+			state.layer_shell ? 'Y' : 'n',
+			state.xdg_output_manager ? 'Y' : 'n');
+
 		return 1;
 	}
 
