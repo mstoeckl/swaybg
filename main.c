@@ -573,7 +573,10 @@ int main(int argc, char **argv) {
 
 	struct wl_registry *registry = wl_display_get_registry(state.display);
 	wl_registry_add_listener(registry, &registry_listener, &state);
-	wl_display_roundtrip(state.display);
+	if (wl_display_roundtrip(state.display) == -1) {
+		swaybg_log(LOG_ERROR, "Failed to roundtrip with the compositor");
+		return 1;
+	}
 	if (state.compositor == NULL || state.shm == NULL ||
 			state.layer_shell == NULL || state.xdg_output_manager == NULL) {
 		swaybg_log(LOG_ERROR, "Missing a required Wayland interface");
