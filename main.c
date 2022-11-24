@@ -9,7 +9,7 @@
 #include <strings.h>
 #include <wayland-client.h>
 #include "background-image.h"
-#include "cairo_util.h"
+#include <vips/vips.h>
 #include "log.h"
 #include "pool-buffer.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
@@ -102,7 +102,39 @@ bool is_valid_color(const char *color) {
 	return true;
 }
 
-static void render_frame(struct swaybg_output *output, cairo_surface_t *surface) {
+struct rgba_pixel {
+	uint8_t r;
+	uint8_t g;
+	uint8_t b;
+	uint8_t a;
+};
+
+VipsImage *load_background_image(const char *path) {
+	// TODO: add load options?
+	// may need to escape load options if filename ends in [name=value]
+	VipsImage *image = vips_image_new_from_file (path, "access", VIPS_ACCESS_SEQUENTIAL, NULL);
+	if (!image) {
+		swaybg_log(LOG_ERROR, "Failed to read background image.");
+		return NULL;
+	}
+
+	int bands = vips_image_get_bands(image);
+	if (!(bands == 3 || bands == 4)) {
+		swaybg_log(LOG_ERROR, "Background image had %d channels, need either 3 or 4.", bands);
+		g_object_unref(image);
+		return NULL;
+	}
+
+	VipsInterpretation interp = vips_image_get_interpretation(image);
+	if (interp == VIPS_INTERPRETATION_ERROR) {
+		swaybg_log(LOG_ERROR, "Image was not properly interpreted.");
+		g_object_unref(image);
+		return NULL;
+	}
+	return image;
+}
+
+static void render_frame(struct swaybg_output *output, VipsImage *surface) {
 	int buffer_width = output->width * output->scale,
 		buffer_height = output->height * output->scale;
 
@@ -119,13 +151,13 @@ static void render_frame(struct swaybg_output *output, cairo_surface_t *surface)
 		return;
 	}
 
+	uint8_t r8 = (output->config->color >> 24) & 0xFF;
+	uint8_t g8 = (output->config->color >> 16) & 0xFF;
+	uint8_t b8 = (output->config->color >> 8) & 0xFF;
+	uint8_t a8 = (output->config->color >> 0) & 0xFF;
 	if (output->config->mode == BACKGROUND_MODE_SOLID_COLOR &&
 			output->state->viewporter &&
 			output->state->single_pixel_buffer_manager) {
-		uint8_t r8 = (output->config->color >> 24) & 0xFF;
-		uint8_t g8 = (output->config->color >> 16) & 0xFF;
-		uint8_t b8 = (output->config->color >> 8) & 0xFF;
-		uint8_t a8 = (output->config->color >> 0) & 0xFF;
 		uint32_t f = 0xFFFFFFFF / 0xFF; // division result is an integer
 		uint32_t r32 = r8 * f;
 		uint32_t g32 = g8 * f;
@@ -149,29 +181,124 @@ static void render_frame(struct swaybg_output *output, cairo_surface_t *surface)
 
 	struct pool_buffer buffer;
 	if (!create_buffer(&buffer, output->state->shm,
-			buffer_width, buffer_height, WL_SHM_FORMAT_ARGB8888)) {
+			buffer_width, buffer_height, WL_SHM_FORMAT_XRGB8888)) {
 		return;
 	}
 
-	cairo_t *cairo = buffer.cairo;
-	cairo_save(cairo);
-	cairo_set_operator(cairo, CAIRO_OPERATOR_CLEAR);
-	cairo_paint(cairo);
-	cairo_restore(cairo);
-	if (output->config->mode == BACKGROUND_MODE_SOLID_COLOR) {
-		cairo_set_source_u32(cairo, output->config->color);
-		cairo_paint(cairo);
-	} else {
-		if (output->config->color) {
-			cairo_set_source_u32(cairo, output->config->color);
-			cairo_paint(cairo);
-		}
+	// single pixel vips image + vips replicate appears expensive
+	// todo: create a custom 'fill' image type instead
+	char* dat = malloc(buffer_width * buffer_height * 3);
+	for (int i = 0; i < buffer_width * buffer_height; i++) {
+		dat[3 * i] = r8;
+		dat[3 * i + 1] = g8;
+		dat[3 * i + 2] = b8;
+	}
+	VipsImage *bg = vips_image_new_from_memory_copy(dat, 3 * buffer_width * buffer_height, buffer_width, buffer_height, 3, VIPS_FORMAT_UCHAR);
+	if (!bg) {
+		swaybg_log(LOG_ERROR, "failed to allocate background: %s", vips_error_buffer());
+		return;
+	}
+	free(dat);
+	VipsImage *dst = NULL;
+	if (vips_colourspace(bg, &dst, VIPS_INTERPRETATION_sRGB, NULL) == -1) {
+		swaybg_log(LOG_ERROR, "failed to set colorspace: %s", vips_error_buffer());
+	}
 
-		if (surface) {
-			render_background_image(cairo, surface,
-				output->config->mode, buffer_width, buffer_height);
+	int surf_width = vips_image_get_width(surface);
+	int surf_height = vips_image_get_height(surface);
+	VipsImage *tmp = NULL;
+	switch (output->config->mode) {
+	case BACKGROUND_MODE_STRETCH: {
+		double xscale = buffer_width / (double)surf_width;
+		double yscale = buffer_height / (double)surf_height;
+		if (vips_resize(surface, &tmp, xscale, "vscale", yscale, NULL) == -1) {
+			swaybg_log(LOG_ERROR, "failed to resize image: %s", vips_error_buffer());
+		}
+		if (vips_composite2(dst, tmp, &dst, VIPS_BLEND_MODE_OVER, NULL) == -1) {
+			swaybg_log(LOG_ERROR, "failed to composite image: %s", vips_error_buffer());
+		}
+	} break;
+	case BACKGROUND_MODE_FIT:
+	case BACKGROUND_MODE_FILL: {
+		bool buffer_is_wider = (int64_t)surf_width * buffer_height
+			>= (int64_t)surf_height * buffer_width;
+		bool match_x = buffer_is_wider == (output->config->mode == BACKGROUND_MODE_FIT);
+
+		double scale;
+		gint dx,dy;
+		if (match_x) {
+			scale = (double)buffer_width / surf_width;
+			dx = 0;
+			dy = (gint)((buffer_height - scale * surf_height) / 2.0);
+		} else {
+			scale = (double)buffer_height / surf_height;
+			dy = 0;
+			dx = (gint)((buffer_width - scale * surf_width) / 2.0);
+		}
+		if (vips_resize(surface, &tmp, scale, NULL) == -1) {
+			swaybg_log(LOG_ERROR, "failed to resize image: %s", vips_error_buffer());
+		}
+		if (vips_composite2(dst, tmp, &dst, VIPS_BLEND_MODE_OVER,  "x", dx, "y", dy, NULL) == -1) {
+			swaybg_log(LOG_ERROR, "failed to composite image: %s", vips_error_buffer());
+		}
+	} break;
+	case BACKGROUND_MODE_CENTER: {
+		gint dx = (buffer_width - surf_width) / 2;
+		gint dy = (buffer_height - surf_height) / 2;
+		if (vips_composite2(dst, surface, &dst, VIPS_BLEND_MODE_OVER,  "x", dx, "y", dy, NULL) == -1) {
+			swaybg_log(LOG_ERROR, "failed to composite image: %s", vips_error_buffer());
+		}
+	} break;
+	case BACKGROUND_MODE_TILE: {
+		int rep_x = (buffer_width + surf_width - 1) / surf_width;
+		int rep_y = (buffer_height + surf_height - 1) / surf_height;
+
+		if (vips_replicate(surface, &tmp, rep_x, rep_y, NULL) == -1) {
+			swaybg_log(LOG_ERROR, "failed to replicate image: %s", vips_error_buffer());
+		}
+		if (vips_composite2(dst, tmp, &dst, VIPS_BLEND_MODE_OVER, "x", 0, "y", 0, NULL) == -1) {
+			swaybg_log(LOG_ERROR, "failed to composite image: %s", vips_error_buffer());
+		}
+	} break;
+	case BACKGROUND_MODE_SOLID_COLOR:
+		/* do nothing */
+		break;
+	default:
+		break;
+	}
+
+	/* Using 'prepare_to' or vips_sink_disc it is possible to fill a
+	 * preconstructed buffer with fewer copies */
+	VipsRect rect = {
+		.left = 0,
+		.top = 0,
+		.width = buffer_width,
+		.height = buffer_height,
+	};
+	VipsRegion *region = vips_region_new(dst);
+	if (!region) {
+		swaybg_log(LOG_ERROR, "Failed to create region.");
+	}
+	if (vips_region_prepare(region, &rect) == -1) {
+		swaybg_log(LOG_ERROR, "Failed to prepare region.");
+	}
+
+	int stride = buffer_width * 4;
+	char *o_data = (char*)buffer.data;
+	for (int y = 0; y < buffer_height; y++) {
+		uint32_t *row = (uint32_t *)(o_data + stride * y);
+		for (int x = 0; x < buffer_width; x++) {
+			// libvips orders channels R,G,B,A in memory order, but
+			// ARGB32 (on little endian) has order B,G,R,A
+
+			const struct rgba_pixel *pixel = (const struct rgba_pixel *)VIPS_REGION_ADDR(region, x, y);
+
+			row[x] = (uint32_t)pixel->b | ((uint32_t)pixel->g << 8 )
+				| ((uint32_t)pixel->r << 16 ) | ((uint32_t)pixel->a << 24 );
 		}
 	}
+
+	g_object_unref(region);
 
 	wl_surface_set_buffer_scale(output->surface, output->scale);
 	wl_surface_attach(output->surface, buffer.buffer, 0, 0);
@@ -538,6 +665,7 @@ static void parse_command_line(int argc, char **argv,
 
 int main(int argc, char **argv) {
 	swaybg_log_init(LOG_DEBUG);
+	VIPS_INIT(argv[0]);
 
 	struct swaybg_state state = {0};
 	wl_list_init(&state.configs);
@@ -616,7 +744,9 @@ int main(int argc, char **argv) {
 				continue;
 			}
 
-			cairo_surface_t *surface = load_background_image(image->path);
+
+			// load: returns vips_image
+			VipsImage *surface = load_background_image(image->path);
 			if (!surface) {
 				swaybg_log(LOG_ERROR, "Failed to load image: %s", image->path);
 				continue;
@@ -629,8 +759,9 @@ int main(int argc, char **argv) {
 				}
 			}
 
+
 			image->load_required = false;
-			cairo_surface_destroy(surface);
+			g_object_unref(surface);
 		}
 
 		// Redraw outputs without associated image
@@ -656,6 +787,8 @@ int main(int argc, char **argv) {
 	wl_list_for_each_safe(image, tmp_image, &state.images, link) {
 		destroy_swaybg_image(image);
 	}
+
+	vips_shutdown();
 
 	return 0;
 }

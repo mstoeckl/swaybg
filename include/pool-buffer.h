@@ -1,14 +1,11 @@
 #ifndef _SWAY_BUFFERS_H
 #define _SWAY_BUFFERS_H
-#include <cairo.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <wayland-client.h>
 
 struct pool_buffer {
 	struct wl_buffer *buffer;
-	cairo_surface_t *surface;
-	cairo_t *cairo;
 	void *data;
 	size_t size;
 };
