@@ -149,7 +149,7 @@ static void render_frame(struct swaybg_output *output, cairo_surface_t *surface)
 
 	struct pool_buffer buffer;
 	if (!create_buffer(&buffer, output->state->shm,
-			buffer_width, buffer_height, WL_SHM_FORMAT_ARGB8888)) {
+			buffer_width, buffer_height, WL_SHM_FORMAT_XRGB8888)) {
 		return;
 	}
 
