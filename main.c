@@ -102,7 +102,7 @@ bool is_valid_color(const char *color) {
 	return true;
 }
 
-static void render_frame(struct swaybg_output *output, cairo_surface_t *surface) {
+static void render_frame(struct swaybg_output *output, pixman_image_t *surface) {
 	int buffer_width = output->width * output->scale,
 		buffer_height = output->height * output->scale;
 
@@ -153,13 +153,24 @@ static void render_frame(struct swaybg_output *output, cairo_surface_t *surface)
 		return;
 	}
 
-	cairo_t *cairo = buffer.cairo;
+	pixman_image_t *image = buffer.image;
 	uint32_t bg_color = output->config->color ? output->config->color : 0x3f3f3fff;
-	cairo_set_source_u32(cairo, bg_color);
-	cairo_paint(cairo);
+	pixman_color_t fill_color = {
+		.red = 0x101 * ((bg_color >> 24) & 0xff),
+		.green = 0x101 * ((bg_color >> 16) & 0xff),
+		.blue = 0x101 * ((bg_color >> 8) & 0xff),
+		.alpha = 0xffff,
+	};
+	pixman_box32_t box = {
+		.x1 = 0,
+		.y1 = 0,
+		.x2 = buffer_width,
+		.y2 = buffer_height,
+	};
+	pixman_image_fill_boxes(PIXMAN_OP_SRC, image, &fill_color, 1, &box);
 
 	if (surface) {
-		render_background_image(cairo, surface,
+		render_background_image(image, surface,
 			output->config->mode, buffer_width, buffer_height);
 	}
 
@@ -612,14 +623,27 @@ int main(int argc, char **argv) {
 				continue;
 			}
 
+			pixman_format_code_t format =
+				cairo_image_surface_get_format(surface) == CAIRO_FORMAT_RGB24
+				? PIXMAN_x8r8g8b8 : PIXMAN_a8r8g8b8;
+
+
+			pixman_image_t *pixman_image = pixman_image_create_bits(
+				format,
+				cairo_image_surface_get_width(surface),
+				cairo_image_surface_get_height(surface),
+				(uint32_t *)cairo_image_surface_get_data(surface),
+				cairo_image_surface_get_stride(surface));
+
 			wl_list_for_each(output, &state.outputs, link) {
 				if (output->dirty && output->config->image == image) {
 					output->dirty = false;
-					render_frame(output, surface);
+					render_frame(output, pixman_image);
 				}
 			}
 
 			image->load_required = false;
+			pixman_image_unref(pixman_image);
 			cairo_surface_destroy(surface);
 		}
 

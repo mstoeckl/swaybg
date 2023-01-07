@@ -33,6 +33,7 @@ wayland_client = dependency('wayland-client')
 wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 wayland_scanner = dependency('wayland-scanner', version: '>=1.14.91', native: true)
 cairo = dependency('cairo')
+pixman = dependency('pixman-1')
 gdk_pixbuf = dependency('gdk-pixbuf-2.0', required: get_option('gdk-pixbuf'))
 
 git = find_program('git', required: false, native: true)
@@ -95,6 +96,7 @@ executable(
 	include_directories: 'include',
 	dependencies: [
 		cairo,
+		pixman,
 		rt,
 		gdk_pixbuf,
 		wayland_client,

@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809
 #include <assert.h>
-#include <cairo.h>
+#include <pixman.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -59,9 +59,8 @@ bool create_buffer(struct pool_buffer *buf, struct wl_shm *shm,
 
 	buf->size = size;
 	buf->data = data;
-	buf->surface = cairo_image_surface_create_for_data(data,
-			CAIRO_FORMAT_RGB24, width, height, stride);
-	buf->cairo = cairo_create(buf->surface);
+	pixman_format_code_t pix_fmt = PIXMAN_x8r8g8b8;
+	buf->image = pixman_image_create_bits(pix_fmt, width, height, data, stride);
 	return true;
 }
 
@@ -69,11 +68,8 @@ void destroy_buffer(struct pool_buffer *buffer) {
 	if (buffer->buffer) {
 		wl_buffer_destroy(buffer->buffer);
 	}
-	if (buffer->cairo) {
-		cairo_destroy(buffer->cairo);
-	}
-	if (buffer->surface) {
-		cairo_surface_destroy(buffer->surface);
+	if (buffer->image) {
+		pixman_image_unref(buffer->image);
 	}
 	if (buffer->data) {
 		munmap(buffer->data, buffer->size);
