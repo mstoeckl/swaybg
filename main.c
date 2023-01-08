@@ -9,7 +9,6 @@
 #include <strings.h>
 #include <wayland-client.h>
 #include "background-image.h"
-#include "cairo_util.h"
 #include "log.h"
 #include "pool-buffer.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
@@ -617,23 +616,11 @@ int main(int argc, char **argv) {
 				continue;
 			}
 
-			cairo_surface_t *surface = load_background_image(image->path);
-			if (!surface) {
+			pixman_image_t *pixman_image = load_background_image(image->path);
+			if (!pixman_image) {
 				swaybg_log(LOG_ERROR, "Failed to load image: %s", image->path);
 				continue;
 			}
-
-			pixman_format_code_t format =
-				cairo_image_surface_get_format(surface) == CAIRO_FORMAT_RGB24
-				? PIXMAN_x8r8g8b8 : PIXMAN_a8r8g8b8;
-
-
-			pixman_image_t *pixman_image = pixman_image_create_bits(
-				format,
-				cairo_image_surface_get_width(surface),
-				cairo_image_surface_get_height(surface),
-				(uint32_t *)cairo_image_surface_get_data(surface),
-				cairo_image_surface_get_stride(surface));
 
 			wl_list_for_each(output, &state.outputs, link) {
 				if (output->dirty && output->config->image == image) {
@@ -644,7 +631,6 @@ int main(int argc, char **argv) {
 
 			image->load_required = false;
 			pixman_image_unref(pixman_image);
-			cairo_surface_destroy(surface);
 		}
 
 		// Redraw outputs without associated image

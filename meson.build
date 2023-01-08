@@ -87,7 +87,6 @@ executable(
 	'swaybg',
 	[
 		'background-image.c',
-		'cairo.c',
 		'log.c',
 		'main.c',
 		'pool-buffer.c',
