@@ -3,10 +3,9 @@
 #include <stdlib.h>
 #include "background-image.h"
 #include "log.h"
+#include "png.h"
 #if HAVE_GDK_PIXBUF
 #include <gdk-pixbuf/gdk-pixbuf.h>
-#else
-#include <cairo.h>
 #endif
 
 enum background_mode parse_background_mode(const char *mode) {
@@ -25,6 +24,93 @@ enum background_mode parse_background_mode(const char *mode) {
 	}
 	swaybg_log(LOG_ERROR, "Unsupported background mode: %s", mode);
 	return BACKGROUND_MODE_INVALID;
+}
+
+static pixman_image_t *pixman_image_from_png(const char *path) {
+	FILE *file = fopen(path, "r");
+	if (!file) {
+		swaybg_log(LOG_ERROR, "Failed to open background image: %s",
+			strerror(errno));
+		return NULL;
+	}
+
+	png_struct *png = png_create_read_struct(PNG_LIBPNG_VER_STRING,
+		NULL, NULL, NULL);
+	if (!png) {
+		return NULL;
+	}
+
+	png_info *info = png_create_info_struct(png);
+	if (!info) {
+		png_destroy_read_struct(&png, NULL, NULL);
+		return NULL;
+	}
+
+	pixman_image_t *image = NULL;
+	png_byte *tmp_row = NULL;
+
+#ifdef PNG_SETJMP_SUPPORTED
+	if (setjmp(png_jmpbuf(png))) {
+		if (image) {
+			pixman_image_unref(image);
+		}
+		goto cleanup;
+	}
+#endif
+	png_init_io(png, file);
+
+	png_read_info(png, info);
+
+	png_uint_32 width, height;
+	int bit_depth, color_type;
+	png_get_IHDR(png, info, &width, &height, &bit_depth,
+		&color_type, NULL, NULL, NULL);
+
+	// provide RGB(A) data
+	png_set_expand(png);
+
+	// request 8 bit data
+	png_set_scale_16(png);
+
+	png_read_update_info(png, info);
+
+	bool has_alpha = color_type & PNG_COLOR_MASK_ALPHA;
+
+	image = pixman_image_create_bits(has_alpha ? PIXMAN_a8r8g8b8 : PIXMAN_x8r8g8b8,
+		width, height, NULL, 0);
+	if (!image) {
+		goto cleanup;
+	}
+	char *image_data = (char *)pixman_image_get_data(image);
+	uint32_t stride = pixman_image_get_stride(image);
+
+	tmp_row = calloc(width, 4);
+	for (size_t y = 0; y < height; y++) {
+		png_read_row(png, tmp_row, NULL);
+		if (has_alpha) {
+			for (size_t x = 0; x < width; x++) {
+				// premultiply
+				uint8_t alpha = tmp_row[4 * x + 3];
+				tmp_row[4 * x + 0] *= alpha;
+				tmp_row[4 * x + 1] *= alpha;
+				tmp_row[4 * x + 2] *= alpha;
+			}
+		}
+		memcpy(image_data + stride * y, tmp_row, width * 4);
+	}
+
+	png_read_end(png, NULL);
+
+cleanup:
+	free(tmp_row);
+	if (info) {
+		png_destroy_info_struct(png, &info);
+	}
+	if (png) {
+		png_destroy_read_struct(&png, NULL, NULL);
+	}
+	fclose(file);
+	return image;
 }
 
 #if HAVE_GDK_PIXBUF
@@ -122,51 +208,35 @@ static pixman_image_t* pixman_image_surface_create_from_pixbuf(const GdkPixbuf *
 #endif // !HAVE_GDK_PIXBUF
 
 pixman_image_t *load_background_image(const char *path) {
-	pixman_image_t *image;
+	pixman_image_t *image = NULL;
+
+	const char *suffix = strrchr(path, '.');
+	// another option would be to check the first 8 bytes for a signature
+	if (suffix && (!strcmp(suffix, ".png") || !strcmp(suffix, ".PNG"))) {
+		image = pixman_image_from_png(path);
+	}
+
 #if HAVE_GDK_PIXBUF
-	GError *err = NULL;
-	GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(path, &err);
-	if (!pixbuf) {
-		swaybg_log(LOG_ERROR, "Failed to load background image (%s).",
-				err->message);
-		return NULL;
+	if (!image) {
+		GError *err = NULL;
+		GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(path, &err);
+		if (!pixbuf) {
+			swaybg_log(LOG_ERROR, "Failed to load background image (%s).",
+					err->message);
+			return NULL;
+		}
+		image = pixman_image_surface_create_from_pixbuf(pixbuf);
+		g_object_unref(pixbuf);
 	}
-	image = pixman_image_surface_create_from_pixbuf(pixbuf);
-	g_object_unref(pixbuf);
-#else
-	cairo_surface_t *surface = cairo_image_surface_create_from_png(path);
-	if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
-		swaybg_log(LOG_ERROR, "Failed to load background image: %s"
-			"\nSway was compiled without gdk_pixbuf support, so only"
-			"\nPNG images can be loaded. This is the likely cause.",
-			cairo_status_to_string(cairo_surface_status(surface)));
-		return NULL;
-	}
-	image = pixman_image_create_bits(PIXMAN_a8r8g8b8,
-		cairo_image_surface_get_width(surface),
-		cairo_image_surface_get_height(surface),
-		NULL, 0);
-	if (image) {
-		// convert format by blitting surface onto image
-		cairo_surface_t *dst = cairo_image_surface_create_for_data(
-			(unsigned char *)pixman_image_get_data(image),
-			CAIRO_FORMAT_ARGB32,
-			pixman_image_get_width(image),
-			pixman_image_get_height(image),
-			pixman_image_get_stride(image));
-		cairo_t *cairo = cairo_create(dst);
-		cairo_set_source_surface(cairo, surface, 0, 0);
-		cairo_paint(cairo);
-		cairo_destroy(cairo);
-
-		cairo_surface_flush(dst);
-	}
-	cairo_surface_destroy(surface);
-
-#endif // HAVE_GDK_PIXBUF
+#endif
 
 	if (!image) {
-		swaybg_log(LOG_ERROR, "Failed to read background image.");
+		swaybg_log(LOG_ERROR, "Failed to load background image:"
+#if !HAVE_GDK_PIXBUF
+			"\nSway was compiled without gdk_pixbuf support, so only"
+			"\nPNG images can be loaded. This is the likely cause."
+#endif
+			);
 		return NULL;
 	}
 	return image;

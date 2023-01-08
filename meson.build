@@ -32,7 +32,7 @@ rt = cc.find_library('rt')
 wayland_client = dependency('wayland-client')
 wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 wayland_scanner = dependency('wayland-scanner', version: '>=1.14.91', native: true)
-cairo = dependency('cairo')
+png = dependency('libpng')
 pixman = dependency('pixman-1')
 gdk_pixbuf = dependency('gdk-pixbuf-2.0', required: get_option('gdk-pixbuf'))
 
@@ -94,8 +94,8 @@ executable(
 	],
 	include_directories: 'include',
 	dependencies: [
-		cairo,
 		pixman,
+		png,
 		rt,
 		gdk_pixbuf,
 		wayland_client,
