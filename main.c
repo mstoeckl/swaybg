@@ -44,6 +44,7 @@ struct swaybg_state {
 	struct wl_list outputs;  // struct swaybg_output::link
 	struct wl_list images;   // struct swaybg_image::link
 	bool run_display;
+	bool has_xbgr2101010;
 };
 
 struct swaybg_image {
@@ -146,9 +147,13 @@ static void render_frame(struct swaybg_output *output, pixman_image_t *surface) 
 		return;
 	}
 
+	bool use_10bit = SWAYBG_LITTLE_ENDIAN && output->state->has_xbgr2101010 &&
+		surface && PIXMAN_FORMAT_R(pixman_image_get_format(surface)) > 8;
+	uint32_t buffer_format = use_10bit ? WL_SHM_FORMAT_XBGR2101010 : WL_SHM_FORMAT_XRGB8888;
+
 	struct pool_buffer buffer;
 	if (!create_buffer(&buffer, output->state->shm,
-			buffer_width, buffer_height, WL_SHM_FORMAT_XRGB8888)) {
+			buffer_width, buffer_height, buffer_format)) {
 		return;
 	}
 
@@ -359,6 +364,17 @@ static const struct wl_output_listener output_listener = {
 	.description = output_description,
 };
 
+static void shm_format(void *data, struct wl_shm *wl_shm, uint32_t format) {
+	struct swaybg_state *state = data;
+	if (format == WL_SHM_FORMAT_XBGR2101010) {
+		state->has_xbgr2101010 = true;
+	}
+}
+
+static const struct wl_shm_listener shm_listener = {
+	.format = shm_format,
+};
+
 static void handle_global(void *data, struct wl_registry *registry,
 		uint32_t name, const char *interface, uint32_t version) {
 	struct swaybg_state *state = data;
@@ -367,6 +383,7 @@ static void handle_global(void *data, struct wl_registry *registry,
 			wl_registry_bind(registry, name, &wl_compositor_interface, 4);
 	} else if (strcmp(interface, wl_shm_interface.name) == 0) {
 		state->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+		wl_shm_add_listener(state->shm, &shm_listener, state);
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
 		struct swaybg_output *output = calloc(1, sizeof(struct swaybg_output));
 		output->state = state;

@@ -37,6 +37,22 @@ static int anonymous_shm_open(void) {
 	return -1;
 }
 
+static pixman_format_code_t wl_shm_to_pixman_format(uint32_t shm) {
+	switch (shm) {
+#if SWAYBG_LITTLE_ENDIAN
+	case WL_SHM_FORMAT_XRGB8888:
+		return PIXMAN_x8r8g8b8;
+	case WL_SHM_FORMAT_XBGR2101010:
+		return PIXMAN_x2b10g10r10;
+#else
+	case WL_SHM_FORMAT_XRGB8888:
+		return PIXMAN_b8g8r8x8;
+#endif
+	default:
+		assert(false);
+	}
+}
+
 bool create_buffer(struct pool_buffer *buf, struct wl_shm *shm,
 		int32_t width, int32_t height, uint32_t format) {
 	uint32_t stride = width * 4;
@@ -59,7 +75,7 @@ bool create_buffer(struct pool_buffer *buf, struct wl_shm *shm,
 
 	buf->size = size;
 	buf->data = data;
-	pixman_format_code_t pix_fmt = PIXMAN_x8r8g8b8;
+	pixman_format_code_t pix_fmt = wl_shm_to_pixman_format(format);
 	buf->image = pixman_image_create_bits(pix_fmt, width, height, data, stride);
 	return true;
 }

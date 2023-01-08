@@ -47,7 +47,7 @@ static pixman_image_t *pixman_image_from_png(const char *path) {
 	}
 
 	pixman_image_t *image = NULL;
-	png_byte *tmp_row = NULL;
+	uint16_t *tmp_row = NULL;
 
 #ifdef PNG_SETJMP_SUPPORTED
 	if (setjmp(png_jmpbuf(png))) {
@@ -65,38 +65,75 @@ static pixman_image_t *pixman_image_from_png(const char *path) {
 	int bit_depth, color_type;
 	png_get_IHDR(png, info, &width, &height, &bit_depth,
 		&color_type, NULL, NULL, NULL);
+	bool fmt_16 = bit_depth == 16;
+	bool has_alpha = color_type & PNG_COLOR_MASK_ALPHA;
 
 	// provide RGB(A) data
 	png_set_expand(png);
 
-	// request 8 bit data
-	png_set_scale_16(png);
+#if SWAYBG_LITTLE_ENDIAN
+	png_set_swap(png);
+#endif
 
 	png_read_update_info(png, info);
+	pixman_format_code_t format;
+	if (fmt_16) {
+		// as of writing, this is the narrowest format with >= 10 bits
+		// of color precision and a useful alpha channel
+		format = PIXMAN_rgba_float;
+	} else {
+#if SWAYBG_LITTLE_ENDIAN
+		format = has_alpha ? PIXMAN_a8b8g8r8 : PIXMAN_x8b8g8r8;
+#else
+		format = has_alpha ? PIXMAN_r8g8b8a8 : PIXMAN_r8g8b8x8;
+#endif
+	}
 
-	bool has_alpha = color_type & PNG_COLOR_MASK_ALPHA;
-
-	image = pixman_image_create_bits(has_alpha ? PIXMAN_a8r8g8b8 : PIXMAN_x8r8g8b8,
-		width, height, NULL, 0);
+	image = pixman_image_create_bits(format, width, height, NULL, 0);
 	if (!image) {
 		goto cleanup;
 	}
 	char *image_data = (char *)pixman_image_get_data(image);
 	uint32_t stride = pixman_image_get_stride(image);
 
-	tmp_row = calloc(width, 4);
-	for (size_t y = 0; y < height; y++) {
-		png_read_row(png, tmp_row, NULL);
-		if (has_alpha) {
+	if (fmt_16) {
+		tmp_row = calloc(width, 8);
+
+		for (size_t y = 0; y < height; y++) {
+			png_read_row(png, (png_byte *)tmp_row, NULL);
+
+			float *dst_row = (float *)(image_data + stride * y);
 			for (size_t x = 0; x < width; x++) {
-				// premultiply
-				uint8_t alpha = tmp_row[4 * x + 3];
-				tmp_row[4 * x + 0] *= alpha;
-				tmp_row[4 * x + 1] *= alpha;
-				tmp_row[4 * x + 2] *= alpha;
+				float r = tmp_row[4 * x + 0] * (1. / 65535.0);
+				float g = tmp_row[4 * x + 1] * (1. / 65535.0);
+				float b = tmp_row[4 * x + 2] * (1. / 65535.0);
+				float a = has_alpha ? tmp_row[4 * x + 3] * (1. / 65535.0) : 1.0;
+				if (has_alpha) {
+					r *= a;
+					g *= a;
+					b *= a;
+				}
+
+				dst_row[4 * x + 0] = r;
+				dst_row[4 * x + 1] = g;
+				dst_row[4 * x + 2] = b;
+				dst_row[4 * x + 3] = a;
 			}
 		}
-		memcpy(image_data + stride * y, tmp_row, width * 4);
+	} else {
+		for (size_t y = 0; y < height; y++) {
+			uint8_t *dst_row = (uint8_t *)(image_data + stride * y);
+			png_read_row(png, dst_row, NULL);
+			if (has_alpha) {
+				for (size_t x = 0; x < width; x++) {
+					// premultiply
+					uint8_t alpha = dst_row[4 * x + 3];
+					dst_row[4 * x + 0] = (dst_row[4 * x + 0] * alpha) / 255;
+					dst_row[4 * x + 1] = (dst_row[4 * x + 1] * alpha) / 255;
+					dst_row[4 * x + 2] = (dst_row[4 * x + 2] * alpha) / 255;
+				}
+			}
+		}
 	}
 
 	png_read_end(png, NULL);

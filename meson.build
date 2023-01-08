@@ -48,6 +48,9 @@ if git.found()
 	endif
 endif
 
+is_le = host_machine.endian() == 'little'
+add_project_arguments('-DSWAYBG_LITTLE_ENDIAN=@0@'.format(is_le.to_int()), language: 'c')
+
 add_project_arguments([
 	'-DSWAYBG_VERSION=@0@'.format(version),
 	'-DHAVE_GDK_PIXBUF=@0@'.format(gdk_pixbuf.found().to_int()),
