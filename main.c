@@ -15,6 +15,7 @@
 #include "viewporter-client-protocol.h"
 #include "single-pixel-buffer-v1-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "frog-color-management-v1-client-protocol.h"
 
 /*
  * If `color` is a hexadecimal string of the form 'rrggbb' or '#rrggbb',
@@ -49,6 +50,7 @@ struct swaybg_state {
 	struct wp_viewporter *viewporter;
 	struct wp_single_pixel_buffer_manager_v1 *single_pixel_buffer_manager;
 	struct wp_fractional_scale_manager_v1 *fract_scale_manager;
+	struct frog_color_management_factory_v1 *frog_color_factory;
 	struct wl_list configs;  // struct swaybg_output_config::link
 	struct wl_list outputs;  // struct swaybg_output::link
 	struct wl_list images;   // struct swaybg_image::link
@@ -85,6 +87,7 @@ struct swaybg_output {
 	struct zwlr_layer_surface_v1 *layer_surface;
 	struct wp_viewport *viewport;
 	struct wp_fractional_scale_v1 *fract_scale;
+	struct frog_color_managed_surface *color_surface;
 
 	uint32_t width, height;
 	int32_t scale;
@@ -183,7 +186,8 @@ static void get_buffer_size(const struct swaybg_output *output,
 	}
 }
 
-static void render_frame(struct swaybg_output *output, cairo_surface_t *surface) {
+static void render_frame(struct swaybg_output *output, cairo_surface_t *surface,
+		const struct cicp *metadata) {
 	uint32_t buffer_width, buffer_height;
 	get_buffer_size(output, &buffer_width, &buffer_height);
 
@@ -203,6 +207,45 @@ static void render_frame(struct swaybg_output *output, cairo_surface_t *surface)
 
 		output->buffer_width = buffer_width;
 		output->buffer_height = buffer_height;
+	}
+
+	if (output->color_surface) {
+		frog_color_managed_surface_set_render_intent(output->color_surface,
+			FROG_COLOR_MANAGED_SURFACE_RENDER_INTENT_PERCEPTUAL);
+
+		uint32_t primary = 0;
+		uint32_t transfer = 0;
+		switch (metadata->primaries) {
+		case 1:
+			primary = FROG_COLOR_MANAGED_SURFACE_PRIMARIES_REC709;
+			break;
+		case 9:
+			primary = FROG_COLOR_MANAGED_SURFACE_PRIMARIES_REC2020;
+			break;
+		default:
+			abort();
+		}
+		switch (metadata->transfer) {
+		case 4:
+			primary = FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_GAMMA_22;
+			break;
+		case 8:
+			transfer = FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_SCRGB_LINEAR;
+			break;
+		case 13:
+			transfer = FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_SRGB;
+			break;
+		case 16:
+			transfer = FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_ST2084_PQ;
+			break;
+		default:
+			abort();
+		}
+
+		frog_color_managed_surface_set_known_transfer_function(
+			output->color_surface, transfer);
+		frog_color_managed_surface_set_known_container_color_volume(
+			output->color_surface, primary);
 	}
 
 	if (output->viewport) {
@@ -250,6 +293,9 @@ static void destroy_swaybg_output(struct swaybg_output *output) {
 	if (output->fract_scale != NULL) {
 		wp_fractional_scale_v1_destroy(output->fract_scale);
 	}
+	if (output->color_surface != NULL) {
+		frog_color_managed_surface_destroy(output->color_surface);
+	}
 	wl_output_destroy(output->wl_output);
 	free(output->name);
 	free(output->identifier);
@@ -290,6 +336,29 @@ static const struct wp_fractional_scale_v1_listener fract_scale_listener = {
 	.preferred_scale = fract_preferred_scale
 };
 
+
+static void frog_preferred_metadata(void *data,
+		struct frog_color_managed_surface *frog_color_managed_surface,
+		uint32_t transfer_function,
+		uint32_t output_display_primary_red_x, uint32_t output_display_primary_red_y,
+		uint32_t output_display_primary_green_x, uint32_t output_display_primary_green_y,
+		uint32_t output_display_primary_blue_x, uint32_t output_display_primary_blue_y,
+		uint32_t output_white_point_x, uint32_t output_white_point_y,
+		uint32_t max_luminance,	uint32_t min_luminance,
+		uint32_t max_full_frame_luminance) {
+	swaybg_log(LOG_INFO, "Preferred color metadata: transfer %d max_luminance %d min_luminance %d max_full_frame_luminance %d",
+		transfer_function, max_luminance, min_luminance, max_full_frame_luminance);
+	swaybg_log(LOG_INFO, "Preferred color metadata: red (%d, %d) green (%d, %d) blue (%d %d) white (%d %d)",
+		output_display_primary_red_x, output_display_primary_red_y,
+		output_display_primary_green_x, output_display_primary_green_y,
+		output_display_primary_blue_x, output_display_primary_blue_y,
+		output_white_point_x, output_white_point_y);
+}
+
+static const struct frog_color_managed_surface_listener color_surface_listener = {
+	.preferred_metadata = frog_preferred_metadata,
+};
+
 static void output_geometry(void *data, struct wl_output *output, int32_t x,
 		int32_t y, int32_t width_mm, int32_t height_mm, int32_t subpixel,
 		const char *make, const char *model, int32_t transform) {
@@ -325,6 +394,13 @@ static void create_layer_surface(struct swaybg_output *output) {
 				output->state->fract_scale_manager)) {
 		output->viewport =  wp_viewporter_get_viewport(
 			output->state->viewporter, output->surface);
+	}
+
+	if (output->state->frog_color_factory) {
+		output->color_surface = frog_color_management_factory_v1_get_color_managed_surface(
+			output->state->frog_color_factory, output->surface);
+		frog_color_managed_surface_add_listener(output->color_surface,
+			&color_surface_listener, output);
 	}
 
 	output->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
@@ -466,6 +542,9 @@ static void handle_global(void *data, struct wl_registry *registry,
 	} else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
 		state->fract_scale_manager = wl_registry_bind(registry, name,
 			&wp_fractional_scale_manager_v1_interface, 1);
+	} else if (strcmp(interface, frog_color_management_factory_v1_interface.name) == 0) {
+		state->frog_color_factory = wl_registry_bind(registry, name,
+			&frog_color_management_factory_v1_interface, 1);
 	}
 }
 
@@ -696,7 +775,8 @@ int main(int argc, char **argv) {
 				continue;
 			}
 
-			cairo_surface_t *surface = load_background_image(image->path);
+			struct cicp info;
+			cairo_surface_t *surface = load_background_image(image->path, &info);
 			if (!surface) {
 				swaybg_log(LOG_ERROR, "Failed to load image: %s", image->path);
 				continue;
@@ -705,7 +785,7 @@ int main(int argc, char **argv) {
 			wl_list_for_each(output, &state.outputs, link) {
 				if (output->dirty && output->config->image == image) {
 					output->dirty = false;
-					render_frame(output, surface);
+					render_frame(output, surface, &info);
 				}
 			}
 
@@ -717,7 +797,7 @@ int main(int argc, char **argv) {
 		wl_list_for_each(output, &state.outputs, link) {
 			if (output->dirty) {
 				output->dirty = false;
-				render_frame(output, NULL);
+				render_frame(output, NULL, NULL);
 			}
 		}
 	}

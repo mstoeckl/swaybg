@@ -12,8 +12,15 @@ enum background_mode {
 	BACKGROUND_MODE_INVALID,
 };
 
+struct cicp {
+	uint8_t primaries;
+	uint8_t transfer;
+	uint8_t matrix;
+	uint8_t range;
+};
+
 enum background_mode parse_background_mode(const char *mode);
-cairo_surface_t *load_background_image(const char *path);
+cairo_surface_t *load_background_image(const char *path, struct cicp *color_info);
 void render_background_image(cairo_t *cairo, cairo_surface_t *image,
 		enum background_mode mode, int buffer_width, int buffer_height);
 
