@@ -13,8 +13,12 @@ enum background_mode {
 };
 
 enum background_mode parse_background_mode(const char *mode);
-cairo_surface_t *load_background_image(const char *path);
+cairo_surface_t *load_background_image(const char *path, void *data,
+	void (*size_chooser)(void *data, int width,
+		int height, int *scale_width, int *scale_height),
+	int *surf_orig_width, int *surf_orig_height);
 void render_background_image(cairo_t *cairo, cairo_surface_t *image,
-		enum background_mode mode, int buffer_width, int buffer_height);
+	int image_width, int image_height, enum background_mode mode,
+	int buffer_width, int buffer_height);
 
 #endif

@@ -59,6 +59,7 @@ struct swaybg_image {
 	struct wl_list link;
 	const char *path;
 	bool load_required;
+	struct wl_list dirty_outputs; // struct swaybg_output::image_temp_link
 };
 
 struct swaybg_output_config {
@@ -92,13 +93,15 @@ struct swaybg_output {
 	bool dirty, needs_ack;
 	// dimensions of the wl_buffer attached to the wl_surface
 	uint32_t buffer_width, buffer_height;
+	struct wl_list image_temp_link; // for swaybg_image::dirty_outputs
 
 	struct wl_list link;
 };
 
 // Create a wl_buffer with the specified dimensions and content
 static struct wl_buffer *draw_buffer(const struct swaybg_output *output,
-		cairo_surface_t *surface, uint32_t buffer_width, uint32_t buffer_height) {
+		cairo_surface_t *surface, int surf_orig_width, int surf_orig_height,
+		uint32_t buffer_width, uint32_t buffer_height) {
 	uint32_t bg_color = output->config->color ? output->config->color : 0x000000ff;
 
 	if (buffer_width == 1 && buffer_height == 1 &&
@@ -129,7 +132,7 @@ static struct wl_buffer *draw_buffer(const struct swaybg_output *output,
 	cairo_paint(cairo);
 
 	if (surface) {
-		render_background_image(cairo, surface,
+		render_background_image(cairo, surface, surf_orig_width, surf_orig_height,
 			output->config->mode, buffer_width, buffer_height);
 	}
 
@@ -161,7 +164,8 @@ static void get_buffer_size(const struct swaybg_output *output,
 	}
 }
 
-static void render_frame(struct swaybg_output *output, cairo_surface_t *surface) {
+static void render_frame(struct swaybg_output *output, cairo_surface_t *surface,
+		int surf_orig_width, int surf_orig_height) {
 	uint32_t buffer_width, buffer_height;
 	get_buffer_size(output, &buffer_width, &buffer_height);
 
@@ -169,7 +173,7 @@ static void render_frame(struct swaybg_output *output, cairo_surface_t *surface)
 	struct wl_buffer *buf = NULL;
 	if (buffer_width != output->buffer_width ||
 			buffer_height != output->buffer_height) {
-		buf = draw_buffer(output, surface,
+		buf = draw_buffer(output, surface, surf_orig_width, surf_orig_height,
 			buffer_width, buffer_height);
 		if (!buf) {
 			return;
@@ -579,6 +583,61 @@ static void parse_command_line(int argc, char **argv,
 	}
 }
 
+/* This chooses the image size for scalable images */
+static void size_chooser(void *data, int width, int height,
+		int *scale_width, int *scale_height) {
+	struct wl_list* output_list = data;
+	struct swaybg_output *output;
+	int max_needed_width = 0, max_needed_height = 0;
+	wl_list_for_each(output, output_list, image_temp_link) {
+		uint32_t buffer_width, buffer_height;
+		get_buffer_size(output, &buffer_width, &buffer_height);
+
+		/* gdk pixbuf scaling preserves aspect ratios, which is good for all
+		 * modes except stretch. */
+		double scale_factor;
+		bool window_is_wider = (int64_t)buffer_width * height
+			> (int64_t)buffer_height * width;
+		switch (output->config->mode) {
+		case BACKGROUND_MODE_STRETCH:
+		/* for stretch mode, use fill size; image will later be squashed to fit */
+		case BACKGROUND_MODE_FILL: {
+			if (window_is_wider) {
+				scale_factor = (double)buffer_width / width;
+			} else {
+				scale_factor = (double)buffer_height / height;
+			}
+			break;
+		}
+		case BACKGROUND_MODE_FIT: {
+			if (window_is_wider) {
+				scale_factor = (double)buffer_height / height;
+			} else {
+				scale_factor = (double)buffer_width / width;
+			}
+			break;
+		}
+		case BACKGROUND_MODE_CENTER:
+		case BACKGROUND_MODE_TILE:
+			scale_factor = 1.0;
+			break;
+		case BACKGROUND_MODE_SOLID_COLOR:
+		case BACKGROUND_MODE_INVALID:
+			assert(0);
+			break;
+		}
+		int32_t req_width = width * scale_factor;
+		int32_t req_height = width * scale_factor;
+		max_needed_width = req_width > max_needed_width ?
+			req_width : max_needed_width;
+		max_needed_height = req_height > max_needed_height ?
+			req_height : max_needed_height;
+	}
+
+	*scale_width = max_needed_width;
+	*scale_height = max_needed_height;
+}
+
 int main(int argc, char **argv) {
 	swaybg_log_init(LOG_DEBUG);
 
@@ -608,6 +667,7 @@ int main(int argc, char **argv) {
 		image = calloc(1, sizeof(struct swaybg_image));
 		image->path = config->image_path;
 		wl_list_insert(&state.images, &image->link);
+		wl_list_init(&image->dirty_outputs);
 		config->image = image;
 	}
 
@@ -650,6 +710,8 @@ int main(int argc, char **argv) {
 					output->buffer_height != buffer_height;
 				if (output->config->image && buffer_change) {
 					output->config->image->load_required = true;
+					wl_list_insert(&output->config->image->dirty_outputs,
+						&output->image_temp_link);
 				}
 			}
 		}
@@ -660,7 +722,9 @@ int main(int argc, char **argv) {
 				continue;
 			}
 
-			cairo_surface_t *surface = load_background_image(image->path);
+			int surf_width, surf_height;
+			cairo_surface_t *surface = load_background_image(image->path,
+				&image->dirty_outputs, size_chooser, &surf_width, &surf_height);
 			if (!surface) {
 				swaybg_log(LOG_ERROR, "Failed to load image: %s", image->path);
 				continue;
@@ -669,10 +733,11 @@ int main(int argc, char **argv) {
 			wl_list_for_each(output, &state.outputs, link) {
 				if (output->dirty && output->config->image == image) {
 					output->dirty = false;
-					render_frame(output, surface);
+					render_frame(output, surface, surf_width, surf_height);
 				}
 			}
 
+			wl_list_init(&image->dirty_outputs);
 			image->load_required = false;
 			cairo_surface_destroy(surface);
 		}
@@ -681,7 +746,7 @@ int main(int argc, char **argv) {
 		wl_list_for_each(output, &state.outputs, link) {
 			if (output->dirty) {
 				output->dirty = false;
-				render_frame(output, NULL);
+				render_frame(output, NULL, 0, 0);
 			}
 		}
 	}
