@@ -55,6 +55,10 @@ struct swaybg_state {
 	struct wl_list configs;  // struct swaybg_output_config::link
 	struct wl_list outputs;  // struct swaybg_output::link
 	struct wl_list images;   // struct swaybg_image::link
+	/* The list of all image descriptions for outputs pending commit */
+	struct wl_list image_descs; // struct swaybg_image_desc::link
+	/* The list of all rendered buffers for outputs pending commit */
+	struct wl_list rendered_buffers; // struct swaybg_rendered_buffer::link
 	bool run_display;
 	/* Supported deep buffer types */
 	bool has_xrgb2101010;
@@ -71,6 +75,47 @@ struct swaybg_image {
 	struct wl_list link;
 	const char *path;
 	bool load_required;
+	/* Images are loaded each time a frame is rendered. */
+	uint64_t load_sequence_number;
+};
+
+enum image_desc_state {
+	IMAGE_DESC_WAITING,
+	IMAGE_DESC_READY,
+	IMAGE_DESC_FAILED,
+};
+
+struct swaybg_image_desc {
+	struct wl_list link;
+	uint32_t reference_count;
+
+	struct wp_image_description_v1 *description;
+	enum image_desc_state state;
+
+	/* Parameters that uniquely identify the image description; used to match
+	 * it so that different outputs can share a description and do not need
+	 * to wait for it to be ready. */
+	enum wp_color_manager_v1_primaries primaries;
+	enum wp_color_manager_v1_transfer_function transfer;
+};
+
+/* Parameters that uniquely determine the contents of a rendered buffer */
+struct swaybg_buffer_spec {
+	struct swaybg_image *image;
+	uint64_t load_sequence_number;
+	enum background_mode mode;
+	/* The width and height _of the buffer_; may be 1x1 if solid_color + viewporter used */
+	uint32_t width, height;
+	uint32_t color;
+};
+
+struct swaybg_rendered_buffer {
+	struct wl_list link;
+	uint32_t reference_count;
+
+	struct wl_buffer *buffer;
+
+	struct swaybg_buffer_spec spec;
 };
 
 struct swaybg_output_config {
@@ -80,6 +125,13 @@ struct swaybg_output_config {
 	enum background_mode mode;
 	uint32_t color;
 	struct wl_list link;
+};
+
+struct swaybg_output_state {
+	uint32_t configure_serial;
+	uint32_t width, height;
+	int32_t scale;
+	uint32_t pref_fract_scale;
 };
 
 struct swaybg_output {
@@ -97,26 +149,30 @@ struct swaybg_output {
 	struct wp_fractional_scale_v1 *fract_scale;
 	struct wp_color_management_surface_v1 *color_surface;
 
-	uint32_t width, height;
-	int32_t scale;
-	uint32_t pref_fract_scale;
+	/* The last received state of the output */
+	struct swaybg_output_state next_state;
+	/* The state of the output that has been acknowledged */
+	struct swaybg_output_state acked_state;
+	/* If not NULL, wl_buffer to apply at next commit, matching acked_state */
+	struct swaybg_rendered_buffer *queued_buffer;
+	/* If not NULL, image description to apply at next commit (once it is ready) */
+	struct swaybg_image_desc *queued_image_desc;
 
-	uint32_t configure_serial;
-	bool dirty, needs_ack;
-	// dimensions of the wl_buffer attached to the wl_surface
-	uint32_t buffer_width, buffer_height;
+	/* scratch variables, computed in main loop */
+	bool needs_new_buffer;
+	bool needs_commit;
 
 	struct wl_list link;
 };
 
 // Create a wl_buffer with the specified dimensions and content
-static struct wl_buffer *draw_buffer(const struct swaybg_output *output,
-		cairo_surface_t *surface, uint32_t buffer_width, uint32_t buffer_height) {
-	uint32_t bg_color = output->config->color ? output->config->color : 0x000000ff;
+static struct wl_buffer *draw_buffer(struct swaybg_state *state,
+		const struct swaybg_buffer_spec *spec, cairo_surface_t *surface) {
+	uint32_t bg_color = spec->color ? spec->color : 0x000000ff;
 
-	if (buffer_width == 1 && buffer_height == 1 &&
-			output->config->mode == BACKGROUND_MODE_SOLID_COLOR &&
-			output->state->single_pixel_buffer_manager) {
+	if (spec->width == 1 && spec->height == 1 &&
+			spec->mode == BACKGROUND_MODE_SOLID_COLOR &&
+			state->single_pixel_buffer_manager) {
 		// create and return single pixel buffer
 		uint8_t r8 = (bg_color >> 24) & 0xFF;
 		uint8_t g8 = (bg_color >> 16) & 0xFF;
@@ -126,7 +182,7 @@ static struct wl_buffer *draw_buffer(const struct swaybg_output *output,
 		uint32_t g32 = g8 * f;
 		uint32_t b32 = b8 * f;
 		return wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
-			output->state->single_pixel_buffer_manager,
+			state->single_pixel_buffer_manager,
 			r32, g32, b32, 0xFFFFFFFF);
 	}
 
@@ -141,15 +197,15 @@ static struct wl_buffer *draw_buffer(const struct swaybg_output *output,
 	}
 
 	uint32_t format = WL_SHM_FORMAT_XRGB8888;
-	if (deep_image && output->state->has_xrgb2101010) {
+	if (deep_image && state->has_xrgb2101010) {
 		format = WL_SHM_FORMAT_XRGB2101010;
-	} else if (deep_image && output->state->has_xbgr2101010) {
+	} else if (deep_image && state->has_xbgr2101010) {
 		format = WL_SHM_FORMAT_XBGR2101010;
 	}
 
 	struct pool_buffer buffer;
-	if (!create_buffer(&buffer, output->state->shm,
-			buffer_width, buffer_height, format)) {
+	if (!create_buffer(&buffer, state->shm,
+			spec->width, spec->height, format)) {
 		return NULL;
 	}
 
@@ -159,7 +215,7 @@ static struct wl_buffer *draw_buffer(const struct swaybg_output *output,
 
 	if (surface) {
 		render_background_image(cairo, surface,
-			output->config->mode, buffer_width, buffer_height);
+			spec->mode, spec->width, spec->height);
 	}
 
 	if (format == WL_SHM_FORMAT_XBGR2101010) {
@@ -176,89 +232,140 @@ static struct wl_buffer *draw_buffer(const struct swaybg_output *output,
 #define FRACT_DENOM 120
 
 // Return the size of the buffer that should be attached to this output
-static void get_buffer_size(const struct swaybg_output *output,
+static void get_buffer_size(const struct swaybg_output_state *state,
+		enum background_mode mode, bool has_viewporter,
 		uint32_t *buffer_width, uint32_t *buffer_height) {
-	if (output->config->mode == BACKGROUND_MODE_SOLID_COLOR &&
-			output->state->viewporter) {
-		*buffer_width = 1;
-		*buffer_height = 1;
-	} else if (output->pref_fract_scale && output->state->viewporter) {
-		// rounding mode is 'round half up'
-		*buffer_width = (output->width * output->pref_fract_scale +
-			FRACT_DENOM / 2) / FRACT_DENOM;
-		*buffer_height = (output->height * output->pref_fract_scale +
-			FRACT_DENOM / 2) / FRACT_DENOM;
+	if (mode == BACKGROUND_MODE_SOLID_COLOR) {
+		if (has_viewporter) {
+			*buffer_width = 1;
+			*buffer_height = 1;
+		} else {
+			*buffer_width = state->width;
+			*buffer_height = state->height;
+		}
 	} else {
-		*buffer_width = output->width * output->scale;
-		*buffer_height = output->height * output->scale;
+		if (state->pref_fract_scale && has_viewporter) {
+			// rounding mode is 'round half up'
+			*buffer_width = (state->width * state->pref_fract_scale +
+				FRACT_DENOM / 2) / FRACT_DENOM;
+			*buffer_height = (state->height * state->pref_fract_scale +
+				FRACT_DENOM / 2) / FRACT_DENOM;
+		} else {
+			*buffer_width = state->width * state->scale;
+			*buffer_height = state->height * state->scale;
+		}
 	}
 }
 
-static void render_frame(struct swaybg_output *output, cairo_surface_t *surface,
-		struct cicp *cicp) {
-	uint32_t buffer_width, buffer_height;
-	get_buffer_size(output, &buffer_width, &buffer_height);
-
-	// Attach a new buffer if the desired size has changed
-	struct wl_buffer *buf = NULL;
-	if (buffer_width != output->buffer_width ||
-			buffer_height != output->buffer_height) {
-		buf = draw_buffer(output, surface,
-			buffer_width, buffer_height);
-		if (!buf) {
-			return;
+static struct swaybg_rendered_buffer *get_or_construct_rendered_buffer(
+		struct swaybg_state *state, const struct swaybg_buffer_spec *spec,
+		cairo_surface_t *surface) {
+	struct swaybg_rendered_buffer *buf;
+	wl_list_for_each(buf, &state->rendered_buffers, link) {
+		if (buf->spec.image == spec->image &&
+				buf->spec.color == spec->color &&
+				buf->spec.width == spec->width &&
+				buf->spec.height == spec->height &&
+				buf->spec.mode == spec->mode &&
+				buf->spec.load_sequence_number == spec->load_sequence_number) {
+			buf->reference_count++;
+			return buf;
 		}
+	}
 
-		wl_surface_attach(output->surface, buf, 0, 0);
+	buf = calloc(1, sizeof(*buf));
+	assert(buf);
+	buf->reference_count = 1;
+	wl_list_insert(&state->rendered_buffers, &buf->link);
+	buf->spec = *spec;
+	buf->buffer = draw_buffer(state, spec, surface);
+	return buf;
+}
+
+static void image_desc_failed(void *data,
+		struct wp_image_description_v1 *wp_image_description_v1,
+		uint32_t cause, const char *msg) {
+	struct swaybg_image_desc *desc = data;
+	swaybg_log(LOG_ERROR, "Failed to create image description for tf=%d, primaries=%d: cause=%d, msg=%s",
+		desc->transfer, desc->primaries, cause, msg);
+	assert(desc->state == IMAGE_DESC_WAITING);
+	desc->state = IMAGE_DESC_FAILED;
+}
+
+static void image_desc_ready(void *data,
+		struct wp_image_description_v1 *wp_image_description_v1,
+		uint32_t identity) {
+	struct swaybg_image_desc *desc = data;
+	assert(desc->state == IMAGE_DESC_WAITING);
+	desc->state = IMAGE_DESC_READY;
+}
+
+static const struct wp_image_description_v1_listener image_desc_listener = {
+	.failed = image_desc_failed,
+	.ready = image_desc_ready,
+};
+
+static struct swaybg_image_desc *get_or_construct_image_desc(struct swaybg_state *state,
+		enum wp_color_manager_v1_transfer_function tf, enum wp_color_manager_v1_primaries primaries) {
+	struct swaybg_image_desc *desc;
+	wl_list_for_each(desc, &state->image_descs, link) {
+		if (desc->primaries == primaries && desc->transfer == tf) {
+			desc->reference_count++;
+			return desc;
+		}
+	}
+
+	if (!state->color_manager) {
+		return NULL;
+	}
+	if (tf >= sizeof(state->supported_named_tfs) / sizeof(state->supported_named_tfs[0]) ||
+			!state->supported_named_tfs[tf]) {
+		swaybg_log(LOG_ERROR, "Failed to create image description, named transfer function %d not supported", tf);
+		return NULL;
+	}
+	if (primaries >= sizeof(state->supported_named_primaries) / sizeof(state->supported_named_primaries[0]) ||
+			!state->supported_named_primaries[primaries]) {
+		swaybg_log(LOG_ERROR, "Failed to create image description, named primaries %d not supported", primaries);
+		return NULL;
+	}
+	struct wp_image_description_creator_params_v1 *params =
+		wp_color_manager_v1_create_parametric_creator(state->color_manager);
+	wp_image_description_creator_params_v1_set_primaries_named(params, primaries);
+	wp_image_description_creator_params_v1_set_tf_named(params, tf);
+
+	desc = calloc(1, sizeof(*desc));
+	assert(desc);
+	wl_list_insert(&state->image_descs, &desc->link);
+	desc->description = wp_image_description_creator_params_v1_create(params);
+	wp_image_description_v1_add_listener(desc->description, &image_desc_listener, desc);
+	desc->primaries = primaries;
+	desc->transfer = tf;
+	desc->state = IMAGE_DESC_WAITING;
+	desc->reference_count = 1;
+	return desc;
+
+}
+
+static void commit_frame(struct swaybg_output *output, struct swaybg_rendered_buffer *buffer, struct swaybg_image_desc *desc) {
+	if (buffer) {
+		wl_surface_attach(output->surface, buffer->buffer, 0, 0);
 		wl_surface_damage_buffer(output->surface, 0, 0,
-			buffer_width, buffer_height);
-
-		output->buffer_width = buffer_width;
-		output->buffer_height = buffer_height;
+			buffer->spec.width, buffer->spec.height);
 	}
-
 	if (output->viewport) {
-		wp_viewport_set_destination(output->viewport, output->width, output->height);
+		wp_viewport_set_destination(output->viewport, output->acked_state.width, output->acked_state.height);
 	} else {
-		wl_surface_set_buffer_scale(output->surface, output->scale);
+		if (buffer->spec.mode == BACKGROUND_MODE_SOLID_COLOR) {
+			wl_surface_set_buffer_scale(output->surface, 1);
+		} else {
+			wl_surface_set_buffer_scale(output->surface, output->acked_state.scale);
+		}
 	}
-	if (output->color_surface) {
-		struct wp_image_description_creator_params_v1 *params =
-			wp_color_manager_v1_create_parametric_creator(output->state->color_manager);
-
-		// TODO: update protocol, unconditional import would reduce latency
-		// by a round trip (very important for startup scenarios!).
-		// Really need a 'create_immed' variant.
-
-		// TODO: this relies on the compositor _immediately_
-		// processing parameteric image descriptions, and may fail if e.g.
-		// ICC profiles are parsed asynchronously/in a sandbox. Fortunately, it
-		// cannot prove whether or not we actually waited for ::ready
-
-		// TODO: properly handle delays -- injecting roundtrips and blocking in
-		// any way is the _wrong_ solution
-
-		// TODO: the named descriptions should be done _per image_ not _per background_.
-
-		// Have already checked the compositor supports these (or have fallen back
-		// to sRGB
-		uint32_t tf = cicp_to_wl_tf(cicp->transfer);
-		uint32_t primaries = cicp_to_wl_tf(cicp->primaries);
-
-		wp_image_description_creator_params_v1_set_tf_named(params, tf);
-		wp_image_description_creator_params_v1_set_primaries_named(params, primaries);
-
-		struct wp_image_description_v1 *desc =
-			wp_image_description_creator_params_v1_create(params);
-
-		wp_color_management_surface_v1_set_image_description(output->color_surface, desc,
-			WP_COLOR_MANAGER_V1_RENDER_INTENT_RELATIVE);
+	if (output->color_surface && desc) {
+		assert(desc->state == IMAGE_DESC_READY);
+		wp_color_management_surface_v1_set_image_description(output->color_surface, desc->description, WP_COLOR_MANAGER_V1_RENDER_INTENT_RELATIVE);
 	}
-
 	wl_surface_commit(output->surface);
-	if (buf) {
-		wl_buffer_destroy(buf);
-	}
 }
 
 static void destroy_swaybg_image(struct swaybg_image *image) {
@@ -267,6 +374,26 @@ static void destroy_swaybg_image(struct swaybg_image *image) {
 	}
 	wl_list_remove(&image->link);
 	free(image);
+}
+
+static void unref_swaybg_image_desc(struct swaybg_image_desc *desc) {
+	assert(desc->reference_count > 0);
+	desc->reference_count--;
+	if (desc->reference_count == 0) {
+		wl_list_remove(&desc->link);
+		wp_image_description_v1_destroy(desc->description);
+		free(desc);
+	}
+}
+
+static void unref_swaybg_rendered_buffer(struct swaybg_rendered_buffer *buf) {
+	assert(buf->reference_count > 0);
+	buf->reference_count--;
+	if (buf->reference_count == 0) {
+		wl_list_remove(&buf->link);
+		wl_buffer_destroy(buf->buffer);
+		free(buf);
+	}
 }
 
 static void destroy_swaybg_output_config(struct swaybg_output_config *config) {
@@ -308,11 +435,9 @@ static void layer_surface_configure(void *data,
 		struct zwlr_layer_surface_v1 *surface,
 		uint32_t serial, uint32_t width, uint32_t height) {
 	struct swaybg_output *output = data;
-	output->width = width;
-	output->height = height;
-	output->dirty = true;
-	output->configure_serial = serial;
-	output->needs_ack = true;
+	output->next_state.width = width;
+	output->next_state.height = height;
+	output->next_state.configure_serial = serial;
 }
 
 static void layer_surface_closed(void *data,
@@ -331,7 +456,7 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 static void fract_preferred_scale(void *data, struct wp_fractional_scale_v1 *f,
 		uint32_t scale) {
 	struct swaybg_output *output = data;
-	output->pref_fract_scale = scale;
+	output->next_state.pref_fract_scale = scale;
 }
 
 static const struct wp_fractional_scale_v1_listener fract_scale_listener = {
@@ -417,10 +542,7 @@ static void output_done(void *data, struct wl_output *wl_output) {
 static void output_scale(void *data, struct wl_output *wl_output,
 		int32_t scale) {
 	struct swaybg_output *output = data;
-	output->scale = scale;
-	if (output->state->run_display && output->width > 0 && output->height > 0) {
-		output->dirty = true;
-	}
+	output->next_state.scale = scale;
 }
 
 static void find_config(struct swaybg_output *output, const char *name) {
@@ -550,7 +672,8 @@ static void handle_global(void *data, struct wl_registry *registry,
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
 		struct swaybg_output *output = calloc(1, sizeof(struct swaybg_output));
 		output->state = state;
-		output->scale = 1;
+		output->next_state.scale = 1;
+		output->acked_state.scale = 1;
 		output->wl_name = name;
 		output->wl_output =
 			wl_registry_bind(registry, name, &wl_output_interface, 4);
@@ -595,6 +718,57 @@ static const struct wl_registry_listener registry_listener = {
 	.global = handle_global,
 	.global_remove = handle_global_remove,
 };
+
+static void convert_cicp_to_wl(const struct swaybg_state *state, const struct cicp *cicp,
+		enum wp_color_manager_v1_transfer_function *tf, enum wp_color_manager_v1_primaries *primaries) {
+	bool unsupported = false;
+	uint32_t ctf = cicp_to_wl_tf(cicp->transfer);
+	uint32_t cp = cicp_to_wl_primaries(cicp->primaries);
+
+	if (!state->color_manager && ctf == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB && cp == WP_COLOR_MANAGER_V1_PRIMARIES_SRGB) {
+		/* No color manager, srgb is supported by default */
+		*tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB;
+		*primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB;
+		return;
+	}
+
+	if (ctf == 0) {
+		swaybg_log(LOG_ERROR, "Received image with CICP transfer = %d, has no Wayland equivalent", cicp->transfer);
+		unsupported = true;
+	} else if (ctf >= sizeof(state->supported_named_tfs) / sizeof(state->supported_named_tfs[0]) ||
+			   !state->supported_named_tfs[ctf]) {
+		swaybg_log(LOG_ERROR, "Received image with CICP transfer = %d, not supported by compositor", cicp->transfer);
+		unsupported = true;
+	}
+
+	if (cp == 0) {
+		swaybg_log(LOG_ERROR, "Received image with CICP primaries = %d, has no Wayland equivalent", cicp->primaries);
+		unsupported = true;
+	} else if (cp >= sizeof(state->supported_named_primaries) / sizeof(state->supported_named_primaries[0]) ||
+			   !state->supported_named_primaries[cp]) {
+		swaybg_log(LOG_ERROR, "Received image with CICP primaries = %d, not supported by compositor", cicp->primaries);
+		unsupported = true;
+	}
+
+	if (cicp->range != 1) {
+		swaybg_log(LOG_ERROR, "Received image with CICP range = %d; only full range (1) supported", cicp->range);
+		unsupported = true;
+	}
+	if (cicp->matrix != 0) {
+		swaybg_log(LOG_ERROR, "Received image with CICP matrix = %d; only RGB (0) supported", cicp->matrix);
+		unsupported = true;
+	}
+
+	if (unsupported) {
+		*tf = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB;
+		*primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB;
+	} else {
+		*tf = ctf;
+		*primaries = cp;
+	}
+}
+
+
 
 static bool store_swaybg_output_config(struct swaybg_state *state,
 		struct swaybg_output_config *config) {
@@ -743,6 +917,8 @@ int main(int argc, char **argv) {
 	wl_list_init(&state.configs);
 	wl_list_init(&state.outputs);
 	wl_list_init(&state.images);
+	wl_list_init(&state.image_descs);
+	wl_list_init(&state.rendered_buffers);
 
 	parse_command_line(argc, argv, &state);
 
@@ -791,7 +967,12 @@ int main(int argc, char **argv) {
 	state.run_display = true;
 
 	/* Before processing any images, wait to see what color management
-	 * supports, as this can affect what  */
+	 * supports, as this can affect what error messages are made for
+	 * images whose color parameters are not supported by the compositor.
+	 *
+	 * This wait _might_ be safe to remove in the future, if swaybg does the
+	 * conversion of image data to f16 buffers itself and does not need
+	 * any complicated image descriptions. */
 	while (state.color_manager && !state.color_info_done && state.run_display) {
 		if (wl_display_dispatch(state.display) == -1) {
 			state.run_display = false;
@@ -799,91 +980,131 @@ int main(int argc, char **argv) {
 		}
 	}
 
-
-
-	while (wl_display_dispatch(state.display) != -1 && state.run_display) {
-		// Send acks, and determine which images need to be loaded
+	while (state.run_display) {
 		struct swaybg_output *output;
+		bool work_to_do_now = false;
 		wl_list_for_each(output, &state.outputs, link) {
-			if (output->needs_ack) {
-				output->needs_ack = false;
-				zwlr_layer_surface_v1_ack_configure(
-						output->layer_surface,
-						output->configure_serial);
+			if (output->queued_buffer || output->queued_image_desc) {
+				/* This output is waiting for an image description to
+				 * be ready and should wait to render a new frame until the
+				 * description results are in. */
+				continue;
 			}
-
-			if (output->dirty) {
-				uint32_t buffer_width, buffer_height;
-				get_buffer_size(output, &buffer_width, &buffer_height);
-				bool buffer_change = output->buffer_width != buffer_width ||
-					output->buffer_height != buffer_height;
-				if (output->config->image && buffer_change) {
-					output->config->image->load_required = true;
-				}
+			if (output->next_state.configure_serial != output->acked_state.configure_serial) {
+				work_to_do_now = true;
 			}
 		}
 
-		// Load images, render associated frames, and unload
+		if (work_to_do_now) {
+			if (wl_display_prepare_read(state.display) != -1) {
+				if (wl_display_read_events(state.display) == -1 && errno != EAGAIN) {
+					break;
+				}
+			} else if (errno != EAGAIN) {
+				break;
+			}
+			if (wl_display_dispatch_pending(state.display) == -1) {
+				break;
+			}
+		} else {
+			if (wl_display_dispatch(state.display) == -1) {
+				break;
+			}
+		}
+
+		/* Identify which outputs have changed, what images need to be reloaded,
+		 * and acknowledge configure events. */
+		wl_list_for_each(output, &state.outputs, link) {
+			if (!output->config) {
+				continue;
+			}
+
+			if (output->queued_buffer || output->queued_image_desc) {
+				/* Have already queued a state update; do _NOT_ queue another
+				 * one until the previous image descriptions are ready to avoid
+				 * flooding the compositor. */
+				continue;
+			}
+
+			if (output->next_state.configure_serial != output->acked_state.configure_serial) {
+				zwlr_layer_surface_v1_ack_configure(
+					output->layer_surface,
+					output->next_state.configure_serial);
+			}
+
+
+			uint32_t acked_width, acked_height;
+			get_buffer_size(&output->acked_state, output->config->mode,
+				output->viewport != NULL, &acked_width, &acked_height);
+			uint32_t next_width, next_height;
+			get_buffer_size(&output->next_state, output->config->mode,
+				output->viewport != NULL, &next_width, &next_height);
+
+			bool needs_new_buffer = (acked_width != next_width) || (acked_height != next_height);
+			bool needs_commit = needs_new_buffer;
+			if (state.viewporter && (output->next_state.width != output->acked_state.width
+				|| output->next_state.height != output->acked_state.height)) {
+				needs_commit = true;
+			}
+
+			output->acked_state = output->next_state;
+			output->needs_commit = needs_commit;
+			output->needs_new_buffer = needs_commit;
+			if (needs_new_buffer && output->config->image) {
+				output->config->image->load_required = true;
+			}
+		}
+
+		/* Load images, render associated frames, and unload, to avoid keeping
+		 * image data in memory any longer than necessary */
 		wl_list_for_each(image, &state.images, link) {
 			if (!image->load_required) {
 				continue;
 			}
 
+			/* Note: the results of load_background_image _may_ be different
+			 * every time -- the background image might be a symlink and get
+			 * changed, so when loading the image description may change from
+			 * before, and should be kept in sync with the image content.
+			 *
+			 * This is done to avoid keeping the (possibly huge, since users may
+			 * use an 8k image 'just in case' they connect to an 8k display) image
+			 * data in memory.
+			 *
+			 * Since swaybg already does ~99% of the work for 'on demand reloading',
+			 * it _may_ be worth it to explicitly support this.
+			 */
 			struct cicp info;
 			cairo_surface_t *surface = load_background_image(image->path, &info);
 			if (!surface) {
 				swaybg_log(LOG_ERROR, "Failed to load image: %s", image->path);
 				continue;
 			}
+			image->load_sequence_number++;
 
-			// TODO: extract to a function. Note: The CICP->WL conversion should be
-			// done _per background image_, not _per output_, and this may simplify
-			// the logic of handling async image description setup.
-			// (Fortunately, rendering intent is _not_ part of the image description.)
+			enum wp_color_manager_v1_transfer_function tf;
+			enum wp_color_manager_v1_primaries primaries;
+			convert_cicp_to_wl(&state, &info, &tf, &primaries);
 
-			// TODO: delayed color attachment and commit; waiting for image description
-			// need to be very careful to avoid race conditions
-
-			uint32_t tf = cicp_to_wl_tf(info.transfer);
-			if (tf == 0) {
-				swaybg_log(LOG_ERROR, "Received image with CICP transfer = %d, has no Wayland equivalent", info.transfer);
-				info.present = false;
-			} else if (tf > sizeof(state.supported_named_tfs) / sizeof(state.supported_named_tfs[0]) ||
-					   !state.supported_named_tfs[tf]) {
-				swaybg_log(LOG_ERROR, "Received image with CICP transfer = %d, not supported by compositor", info.transfer);
-				info.present = false;
-			}
-
-			uint32_t primaries = cicp_to_wl_primaries(info.primaries);
-			if (primaries == 0) {
-				swaybg_log(LOG_ERROR, "Received image with CICP primaries = %d, has no Wayland equivalent", info.primaries);
-				info.present = false;
-			} else if (primaries > sizeof(state.supported_named_primaries) / sizeof(state.supported_named_primaries[0]) ||
-					   !state.supported_named_primaries[primaries]) {
-				swaybg_log(LOG_ERROR, "Received image with CICP primaries = %d, not supported by compositor", info.primaries);
-				info.present = false;
-			}
-
-			if (info.range != 1) {
-				swaybg_log(LOG_ERROR, "Received image with CICP range = %d; only full range (1) supported", info.range);
-				info.present = false;
-			}
-			if (info.matrix != 0) {
-				swaybg_log(LOG_ERROR, "Received image with CICP matrix = %d; only RGB (0) supported", info.matrix);
-				info.present = false;
-			}
-
-			if (!info.present) {
-				info.primaries = 1; // sRGB primaries
-				info.transfer = 13; // sRGB transfer function
-				info.matrix = 0; // RGB
-				info.range = 1; // full range
-			}
+			struct swaybg_image_desc *desc = get_or_construct_image_desc(&state, tf, primaries);
 
 			wl_list_for_each(output, &state.outputs, link) {
-				if (output->dirty && output->config->image == image) {
-					output->dirty = false;
-					render_frame(output, surface, &info);
+				if (output->needs_new_buffer && output->config->image == image) {
+					output->needs_new_buffer = false;
+
+					struct swaybg_buffer_spec spec = (struct swaybg_buffer_spec) {
+						.color = output->config->color,
+						.mode = output->config->mode,
+						.image = output->config->image,
+						.load_sequence_number = output->config->image->load_sequence_number,
+					};
+					get_buffer_size(&output->acked_state, spec.mode,
+						state.viewporter != NULL, &spec.width, &spec.height);
+
+					struct swaybg_rendered_buffer *buffer =
+						get_or_construct_rendered_buffer(&state, &spec, surface);
+					output->queued_buffer = buffer;
+					output->queued_image_desc = desc;
 				}
 			}
 
@@ -891,12 +1112,56 @@ int main(int argc, char **argv) {
 			cairo_surface_destroy(surface);
 		}
 
-		// Redraw outputs without associated image
 		wl_list_for_each(output, &state.outputs, link) {
-			if (output->dirty) {
-				output->dirty = false;
-				render_frame(output, NULL, NULL);
+			if (output->needs_new_buffer && !output->config->image) {
+				output->needs_new_buffer = false;
+
+				struct swaybg_buffer_spec spec = (struct swaybg_buffer_spec) {
+					.color = output->config->color,
+					.mode = output->config->mode,
+					.image = NULL,
+					.load_sequence_number = 0,
+				};
+				get_buffer_size(&output->acked_state, spec.mode,
+					state.viewporter != NULL, &spec.width, &spec.height);
+
+				struct swaybg_rendered_buffer *buffer =
+					get_or_construct_rendered_buffer(&state, &spec, NULL);
+				output->queued_buffer = buffer;
 			}
+		}
+
+		/* Commit all outputs for which the buffer and image description are ready */
+		wl_list_for_each(output, &state.outputs, link) {
+			if (!output->needs_commit) {
+				continue;
+			}
+			if (output->queued_image_desc) {
+				if (output->queued_image_desc->state == IMAGE_DESC_WAITING) {
+					continue;
+				}
+				if (output->queued_image_desc->state == IMAGE_DESC_FAILED) {
+					/* Have already printed a warning, so just commit without changing the description */
+					output->queued_image_desc = NULL;
+				}
+			}
+			commit_frame(output, output->queued_buffer, output->queued_image_desc);
+			output->needs_commit = false;
+
+			if (output->queued_buffer) {
+				unref_swaybg_rendered_buffer(output->queued_buffer);
+				output->queued_buffer = NULL;
+			}
+			if (output->queued_image_desc) {
+				unref_swaybg_image_desc(output->queued_image_desc);
+				output->queued_image_desc = NULL;
+			}
+			// todo: consider moving 'queued_buffer'/'queued_image_desc' to
+			// output->current_buffer/output->current_image_desc fields, to keep
+			// the objects alive and let them be reused the next time this output
+			// or a similar one is redrawn, reducing latency. Doing this _should_
+			// be effectively free because the compositor needs to keep its copy
+			// of the buffer or image description alive to draw existing surfaces.
 		}
 	}
 
@@ -914,6 +1179,10 @@ int main(int argc, char **argv) {
 	wl_list_for_each_safe(image, tmp_image, &state.images, link) {
 		destroy_swaybg_image(image);
 	}
+
+	/* There should be no references remaining from outputs */
+	assert(wl_list_empty(&state.image_descs));
+	assert(wl_list_empty(&state.rendered_buffers));
 
 	if (state.color_manager) {
 		wp_color_manager_v1_destroy(state.color_manager);

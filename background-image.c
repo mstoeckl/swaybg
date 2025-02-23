@@ -94,7 +94,6 @@ uint32_t cicp_to_wl_primaries(uint8_t primaries) {
 	}
 }
 
-
 static void error_handler(png_structp png_ptr, png_const_charp msg) {
 	// todo: handle libpng errors properly -- e.g., with longjmp
 	// to png_get_error_ptr(png_ptr);
