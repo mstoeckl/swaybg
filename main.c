@@ -363,7 +363,7 @@ static void commit_frame(struct swaybg_output *output, struct swaybg_rendered_bu
 	}
 	if (output->color_surface && desc) {
 		assert(desc->state == IMAGE_DESC_READY);
-		wp_color_management_surface_v1_set_image_description(output->color_surface, desc->description, WP_COLOR_MANAGER_V1_RENDER_INTENT_RELATIVE);
+		wp_color_management_surface_v1_set_image_description(output->color_surface, desc->description, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
 	}
 	wl_surface_commit(output->surface);
 }
@@ -501,7 +501,7 @@ static void create_layer_surface(struct swaybg_output *output) {
 	}
 
 	if (output->state->color_manager && output->state->has_parametric
-		&& output->state->supported_intents[WP_COLOR_MANAGER_V1_RENDER_INTENT_RELATIVE]
+		&& output->state->supported_intents[WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL]
 		&& output->state->supported_named_primaries[WP_COLOR_MANAGER_V1_PRIMARIES_SRGB]
 		&& output->state->supported_named_tfs[WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB]
 		) {
