@@ -260,7 +260,7 @@ static const struct wp_image_description_v1_listener image_desc_listener = {
 
 // Create a wl_buffer with the specified dimensions and content
 static struct wl_buffer *draw_buffer(const struct swaybg_output *output,
-		const struct background_image *image, uint32_t buffer_width, uint32_t buffer_height) {
+		struct background_image *image, uint32_t buffer_width, uint32_t buffer_height) {
 	uint32_t bg_color = output->config->color ? output->config->color : 0x000000ff;
 
 	if (buffer_width == 1 && buffer_height == 1 &&
@@ -290,9 +290,23 @@ static struct wl_buffer *draw_buffer(const struct swaybg_output *output,
 	cairo_set_source_u32(cairo, bg_color);
 	cairo_paint(cairo);
 
-	if (image && image->cairo_surface) {
+	if (image) {
+#if HAVE_GLYCIN
+		if (image->scalable_image) {
+			load_scalable_image(image, buffer_width, buffer_height,
+				output->config->mode);
+		}
+#endif
+
 		render_background_image(cairo, image->cairo_surface,
 			output->config->mode, buffer_width, buffer_height);
+
+#if HAVE_GLYCIN
+		if (image->scalable_image && image->cairo_surface) {
+			cairo_surface_destroy(image->cairo_surface);
+			image->cairo_surface = NULL;
+		}
+#endif
 	}
 
 	// return wl_buffer for caller to use and destroy
@@ -323,7 +337,7 @@ static void get_buffer_size(const struct swaybg_output *output,
 	}
 }
 
-static void render_frame(struct swaybg_output *output, const struct background_image *image) {
+static void render_frame(struct swaybg_output *output, struct background_image *image) {
 	uint32_t buffer_width, buffer_height;
 	get_buffer_size(output, &buffer_width, &buffer_height);
 
@@ -1001,7 +1015,14 @@ int main(int argc, char **argv) {
 			}
 
 			image->load_required = false;
-			cairo_surface_destroy(bg.cairo_surface);
+			if (bg.cairo_surface) {
+				cairo_surface_destroy(bg.cairo_surface);
+			}
+#if HAVE_GLYCIN
+			if (bg.scalable_image) {
+				g_object_unref(bg.scalable_image);
+			}
+#endif
 		}
 
 		// Redraw outputs without associated image

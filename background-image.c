@@ -1,7 +1,4 @@
 #include <assert.h>
-#if HAVE_GLYCIN
-#include <glycin-2/glycin.h>
-#endif
 #include "background-image.h"
 #include "log.h"
 
@@ -24,6 +21,156 @@ enum background_mode parse_background_mode(const char *mode) {
 }
 
 #if HAVE_GLYCIN
+static bool load_frame_data(struct background_image *image, GlyFrame *frame) {
+
+	GlyMemoryFormat format = gly_frame_get_memory_format(frame);
+	assert(format == GLY_MEMORY_B8G8R8A8_PREMULTIPLIED);
+
+	uint32_t width = gly_frame_get_width(frame);
+	uint32_t height = gly_frame_get_height(frame);
+	assert(width > 0 && height > 0);
+
+	uint32_t gly_stride = gly_frame_get_stride(frame);
+	GBytes *bytes = gly_frame_get_buf_bytes(frame);
+	gsize size = 0;
+	const uint8_t *gly_data = (const uint8_t *)g_bytes_get_data(bytes, &size);
+
+	if (width > INT_MAX || height > INT_MAX) {
+		swaybg_log(LOG_ERROR,
+			"Image dimensions %"PRIu32" x %"PRIu32" too large for cairo",
+			width, height);
+		return false;
+	}
+
+	cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+	if (!surface) {
+		swaybg_log(LOG_ERROR,
+			"Failed to create cairo surface of size %"PRIu32" x %"PRIu32,
+			width, height);
+		return false;
+	}
+
+	unsigned char *cairo_data = cairo_image_surface_get_data(surface);
+	int cairo_stride = cairo_image_surface_get_stride(surface);
+
+	cairo_surface_flush (surface);
+	if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+		cairo_surface_destroy(surface);
+		surface = NULL;
+		swaybg_log(LOG_ERROR, "Failed to flush cairo surface");
+		return false;
+	}
+
+	// Convert GLY_MEMORY_B8G8R8A8_PREMULTIPLIED (whose channel order is
+	// endianness independent) with CAIRO_FORMAT_ARGB32 (native endian uint32_t,
+	// premultiplied).
+	for (int y = 0; y < (int)height; y++) {
+		for (int x = 0; x < (int)width; x++) {
+			uint32_t *dst = (uint32_t *)&cairo_data[cairo_stride * y + x * 4];
+			const uint8_t *src  = (const uint8_t*)&gly_data[gly_stride * y + x * 4];
+			*dst = ((uint32_t)src[0] << 0) | ((uint32_t)src[1] << 8)
+				   | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
+		}
+	}
+
+	cairo_surface_mark_dirty(surface);
+	if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+		cairo_surface_destroy(surface);
+		surface = NULL;
+		swaybg_log(LOG_ERROR, "Failed to mark cairo surface dirty");
+		return false;
+	}
+
+	GlyCicp *cicp = gly_frame_get_color_cicp(frame);
+	if (cicp) {
+		image->has_cicp = true;
+		image->cicp.primaries = cicp->color_primaries;
+		image->cicp.transfer = cicp->transfer_characteristics;
+		image->cicp.matrix = cicp->matrix_coefficients;
+		image->cicp.range = cicp->video_full_range_flag;
+		gly_cicp_free(cicp);
+	} else {
+		image->has_cicp = false;
+	}
+
+	image->cairo_surface = surface;
+	return true;
+}
+
+bool load_scalable_image(struct background_image *image,
+		uint32_t output_w, uint32_t output_h, enum background_mode mode) {
+	assert(!image->cairo_surface);
+
+	// Cast to uint64_t to avoid overflows later on if one dimension is > 65536
+	uint64_t image_w = (uint64_t)gly_image_get_width(image->scalable_image);
+	uint64_t image_h = (uint64_t)gly_image_get_height(image->scalable_image);
+
+	uint64_t load_w, load_h;
+	switch (mode) {
+	case BACKGROUND_MODE_STRETCH:
+	case BACKGROUND_MODE_FILL:
+		if ((uint64_t)output_w * image_h >
+				(uint64_t)output_h * image_w) {
+			// Image is taller than output.
+			load_w = (uint64_t)output_w;
+			load_h = (uint64_t)output_w * image_h / image_w;
+		} else {
+			// Image is flatter than output
+			load_h = (uint64_t)output_h;
+			load_w = (uint64_t)output_h * image_w / image_h;
+		}
+		break;
+	case BACKGROUND_MODE_FIT:
+		if ((uint64_t)output_w * (uint64_t)image_h >
+				(uint64_t)output_h * (uint64_t)image_w) {
+			// Image is taller than output.
+			load_h = (uint64_t)output_h;
+			load_w = (uint64_t)output_h * image_w / image_h;
+		} else {
+			// Image is flatter than output
+			load_w = (uint64_t)output_w;
+			load_h = (uint64_t)output_w * image_h / image_w;
+		}
+		break;
+	default:
+		load_w = image_w;
+		load_h = image_h;
+		break;
+	}
+
+	if (load_w <= 0) {
+		load_w = 1;
+	}
+
+	if (load_h <= 0) {
+		load_h = 1;
+	}
+
+	GlyFrameRequest *request = gly_frame_request_new();
+	if (!request) {
+		swaybg_log(LOG_ERROR, "Failed to allocate glycin frame request");
+		return false;
+	}
+
+	gly_frame_request_set_scale(request, (uint32_t)load_w, (uint32_t)load_h);
+
+	// Unlike raster formats, SVG images can be loaded multiple times at different scales
+	GError *error = NULL;
+	GlyFrame *frame = gly_image_get_specific_frame(image->scalable_image, request, &error);
+	g_object_unref(request);
+
+	if (!frame) {
+		swaybg_log(LOG_ERROR, "Failed to render scalable image frame: %s", error->message);
+		g_error_free(error);
+		return false;
+	}
+
+	bool success = load_frame_data(image, frame);
+
+	g_object_unref(frame);
+	return success;
+}
+
 bool load_background_image(const char *path, struct background_image *image) {
 	bool success = false;
 
@@ -50,6 +197,15 @@ bool load_background_image(const char *path, struct background_image *image) {
 		goto err_after_loader;
 	}
 
+	const char *mime_type = gly_image_get_mime_type(gly_image);
+	bool is_scalable = !strcmp(mime_type, "image/svg+xml")
+		|| !strcmp(mime_type, "image/svg+xml-compressed");
+
+	if (is_scalable) {
+		image->scalable_image = gly_image;
+		return true;
+	}
+
 	GlyFrame *frame = gly_image_next_frame(gly_image, &error);
 	if (!frame) {
 		swaybg_log(LOG_ERROR, "Failed to load primary frame of image '%s': %s",
@@ -57,80 +213,8 @@ bool load_background_image(const char *path, struct background_image *image) {
 		g_error_free(error);
 		goto err_after_image;
 	}
-	GlyMemoryFormat format = gly_frame_get_memory_format(frame);
-	assert(format == GLY_MEMORY_B8G8R8A8_PREMULTIPLIED);
+	success = load_frame_data(image, frame);
 
-	uint32_t width = gly_frame_get_width(frame);
-	uint32_t height = gly_frame_get_height(frame);
-	assert(width > 0 && height > 0);
-
-	uint32_t gly_stride = gly_frame_get_stride(frame);
-	GBytes *bytes = gly_frame_get_buf_bytes(frame);
-	gsize size = 0;
-	const uint8_t *gly_data = (const uint8_t *)g_bytes_get_data(bytes, &size);
-
-	if (width > INT_MAX || height > INT_MAX) {
-		swaybg_log(LOG_ERROR,
-			"Image dimensions %"PRIu32" x %"PRIu32" too large for cairo",
-			width, height);
-		goto err_after_frame;
-	}
-
-	cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
-	if (!surface) {
-		swaybg_log(LOG_ERROR,
-			"Failed to create cairo surface of size %"PRIu32" x %"PRIu32,
-			width, height);
-		goto err_after_frame;
-	}
-
-	unsigned char *cairo_data = cairo_image_surface_get_data(surface);
-	int cairo_stride = cairo_image_surface_get_stride(surface);
-
-	cairo_surface_flush (surface);
-	if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
-		cairo_surface_destroy(surface);
-		surface = NULL;
-		swaybg_log(LOG_ERROR, "Failed to flush cairo surface");
-		goto err_after_frame;
-	}
-
-	// Convert GLY_MEMORY_B8G8R8A8_PREMULTIPLIED (whose channel order is
-	// endianness independent) with CAIRO_FORMAT_ARGB32 (native endian uint32_t,
-	// premultiplied).
-	for (int y = 0; y < (int)height; y++) {
-		for (int x = 0; x < (int)width; x++) {
-			uint32_t *dst = (uint32_t *)&cairo_data[cairo_stride * y + x * 4];
-			const uint8_t *src  = (const uint8_t*)&gly_data[gly_stride * y + x * 4];
-			*dst = ((uint32_t)src[0] << 0) | ((uint32_t)src[1] << 8)
-				| ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
-		}
-	}
-
-	cairo_surface_mark_dirty(surface);
-	if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
-		cairo_surface_destroy(surface);
-		surface = NULL;
-		swaybg_log(LOG_ERROR, "Failed to mark cairo surface dirty");
-		goto err_after_frame;
-	}
-
-	GlyCicp *cicp = gly_frame_get_color_cicp(frame);
-	if (cicp) {
-		image->has_cicp = true;
-		image->cicp.primaries = cicp->color_primaries;
-		image->cicp.transfer = cicp->transfer_characteristics;
-		image->cicp.matrix = cicp->matrix_coefficients;
-		image->cicp.range = cicp->video_full_range_flag;
-		gly_cicp_free(cicp);
-	} else {
-		image->has_cicp = false;
-	}
-
-	image->cairo_surface = surface;
-	success = true;
-
-err_after_frame:
 	g_object_unref(frame);
 err_after_image:
 	g_object_unref(gly_image);
